@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phase-based-motion-utility"
+version = "0.1.0"
+description = "Offline PyQt6 utility for phase-based motion amplification."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.7",
+    "jsonschema>=4.23",
+    "numpy>=1.26,<2",
+    "psutil>=5.9",
+    "static-ffmpeg>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+]
+
+[project.scripts]
+phase-motion-app = "phase_motion_app.app.main:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,18 @@
+# Runtime logs
+launch_stdout.log
+launch_stderr.log
+
+# Generated runtime data
+diagnostics/
+scratch/
+
+# Repo-local source/output staging
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+
+# Python test and bytecode artifacts
+.pytest_cache/
+__pycache__/
+*.py[cod]
