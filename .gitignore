@@ -5,6 +5,7 @@ launch_stderr.log
 # Generated runtime data
 diagnostics/
 scratch/
+_analysis/
 
 # Repo-local source/output staging
 input/*
@@ -16,3 +17,12 @@ output/*
 .pytest_cache/
 __pycache__/
 *.py[cod]
+
+# Python packaging/build outputs
+*.egg-info/
+build/
+dist/
+
+# Common local coverage artifacts
+.coverage
+htmlcov/
