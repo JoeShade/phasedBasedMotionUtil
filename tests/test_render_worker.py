@@ -24,6 +24,7 @@ from phase_motion_app.core.render_job import RenderPaths, RenderRequest
 from phase_motion_app.core.sidecar import validate_sidecar_file
 from phase_motion_app.core.toolchain import resolve_toolchain
 from phase_motion_app.core.drift import DriftAssessment
+from phase_motion_app.core.preflight import AnalyzerExecutionMode, SchedulerInputs
 from phase_motion_app.worker.bootstrap import RenderWorkerConfig
 from phase_motion_app.worker.render import render_worker_process_main
 
@@ -214,8 +215,19 @@ def test_render_worker_produces_final_mp4_and_sidecar(tmp_path: Path) -> None:
     assert bundle_payload["scheduler_decisions"]["decode_pass_count"] == 2
     assert bundle_payload["scheduler_decisions"]["pipeline_mode"] == "two_pass_bounded_threaded_pipeline"
     assert bundle_payload["scheduler_decisions"]["internal_queue_depth"] == 1
+    assert bundle_payload["scheduler_decisions"]["compute_worker_count"] == 1
+    assert bundle_payload["scheduler_decisions"]["warp_worker_count"] == 1
+    assert bundle_payload["scheduler_decisions"]["motion_worker_count"] == 1
+    assert bundle_payload["scheduler_decisions"]["analyzer_mode"] == "background_thread"
     assert bundle_payload["intermediate_storage_policy"] == "two_pass_bounded_rgb24_pipeline"
     assert "roi_metrics" in bundle_payload["artifact_paths"]
+    assert sidecar_payload["observed_environment"]["scheduler_clamp_threads"] == 1
+    assert sidecar_payload["observed_environment"]["effective_thread_limits"][
+        "python_compute_coordinator_threads"
+    ] == 1
+    assert sidecar_payload["observed_environment"]["effective_thread_limits"][
+        "python_warp_worker_threads"
+    ] == 1
 
 
 def test_choose_codec_plan_falls_back_without_hevc_encoder(monkeypatch) -> None:
@@ -288,6 +300,35 @@ def test_describe_encode_stream_failure_includes_encoder_stderr() -> None:
     assert "BrokenPipeError: [Errno 32] Broken pipe" in detail
     assert "Encoder exit code 1" in detail
     assert "width not divisible by 2" in detail
+
+
+def test_scheduler_payload_reports_real_runtime_plan_fields() -> None:
+    payload = render_module._scheduler_payload_from_inputs(
+        SchedulerInputs(
+            chunk_frames=64,
+            chunk_cap_frames=96,
+            chunk_target_ram_fraction=0.65,
+            thread_limit=8,
+            precision_bytes=4,
+            native_buffer_multiplier=3.0,
+            internal_queue_depth=3,
+            compute_worker_count=6,
+            warp_worker_count=6,
+            motion_worker_count=3,
+            analyzer_mode=AnalyzerExecutionMode.BACKGROUND_THREAD,
+            analysis_queue_depth=2,
+        )
+    )
+
+    assert payload["chunk_frames"] == 64
+    assert payload["chunk_cap_frames"] == 96
+    assert payload["internal_queue_depth"] == 3
+    assert payload["compute_worker_count"] == 6
+    assert payload["warp_worker_count"] == 6
+    assert payload["motion_worker_count"] == 3
+    assert payload["analyzer_mode"] == "background_thread"
+    assert payload["analyzer_queue_depth"] == 2
+    assert payload["effective_thread_limits"]["python_warp_worker_threads"] == 6
 
 
 def test_render_worker_reports_incremental_phase_processing_frame_progress(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from phase_motion_app.core.models import JobIntent, PhaseSettings, Resolution, ResourcePolicy
 from phase_motion_app.core.preflight import (
+    AnalyzerExecutionMode,
     DiagnosticLevel,
     PreflightInputs,
     ResourceBudget,
@@ -319,3 +320,121 @@ def test_choose_scheduler_inputs_shrinks_chunk_frames_when_ram_is_tighter() -> N
 
     assert tight.chunk_frames >= 1
     assert generous.chunk_frames >= tight.chunk_frames
+
+
+def test_choose_scheduler_inputs_turns_resource_policies_into_distinct_runtime_plans() -> None:
+    source = _source(frame_count=600, width=1280, height=720)
+    conservative_intent = JobIntent(
+        phase=_intent().phase,
+        processing_resolution=Resolution(width=1280, height=720),
+        output_resolution=Resolution(width=1280, height=720),
+        resource_policy=ResourcePolicy.CONSERVATIVE,
+    )
+    balanced_intent = JobIntent(
+        phase=_intent().phase,
+        processing_resolution=Resolution(width=1280, height=720),
+        output_resolution=Resolution(width=1280, height=720),
+        resource_policy=ResourcePolicy.BALANCED,
+    )
+    aggressive_intent = JobIntent(
+        phase=_intent().phase,
+        processing_resolution=Resolution(width=1280, height=720),
+        output_resolution=Resolution(width=1280, height=720),
+        resource_policy=ResourcePolicy.AGGRESSIVE,
+    )
+
+    conservative = choose_scheduler_inputs(
+        intent=conservative_intent,
+        source=source,
+        budgets=_budgets(),
+        diagnostic_level=DiagnosticLevel.BASIC,
+    )
+    balanced = choose_scheduler_inputs(
+        intent=balanced_intent,
+        source=source,
+        budgets=_budgets(),
+        diagnostic_level=DiagnosticLevel.BASIC,
+    )
+    aggressive = choose_scheduler_inputs(
+        intent=aggressive_intent,
+        source=source,
+        budgets=_budgets(),
+        diagnostic_level=DiagnosticLevel.BASIC,
+    )
+
+    assert conservative.internal_queue_depth == 1
+    assert balanced.internal_queue_depth == 2
+    assert aggressive.internal_queue_depth == 3
+    assert conservative.chunk_cap_frames < balanced.chunk_cap_frames <= aggressive.chunk_cap_frames
+    assert conservative.compute_worker_count <= balanced.compute_worker_count <= aggressive.compute_worker_count
+    assert conservative.warp_worker_count <= balanced.warp_worker_count <= aggressive.warp_worker_count
+    assert conservative.motion_worker_count == 1
+    assert balanced.motion_worker_count == 1
+    assert aggressive.motion_worker_count == 1
+    assert conservative.analyzer_mode is AnalyzerExecutionMode.BACKGROUND_THREAD
+    assert balanced.analyzer_mode is AnalyzerExecutionMode.BACKGROUND_THREAD
+    assert aggressive.analyzer_mode is AnalyzerExecutionMode.BACKGROUND_THREAD
+    assert conservative.analysis_queue_depth <= balanced.analysis_queue_depth <= aggressive.analysis_queue_depth
+
+
+def test_choose_scheduler_inputs_aggressive_policy_materially_increases_parallelism() -> None:
+    source = _source(frame_count=900, width=1920, height=1080)
+    budgets = _budgets(available_ram_bytes=24 * 1024 * 1024 * 1024)
+    conservative = choose_scheduler_inputs(
+        intent=JobIntent(
+            phase=_intent().phase,
+            processing_resolution=Resolution(width=1920, height=1080),
+            output_resolution=Resolution(width=1920, height=1080),
+            resource_policy=ResourcePolicy.CONSERVATIVE,
+        ),
+        source=source,
+        budgets=budgets,
+        diagnostic_level=DiagnosticLevel.BASIC,
+    )
+    aggressive = choose_scheduler_inputs(
+        intent=JobIntent(
+            phase=_intent().phase,
+            processing_resolution=Resolution(width=1920, height=1080),
+            output_resolution=Resolution(width=1920, height=1080),
+            resource_policy=ResourcePolicy.AGGRESSIVE,
+        ),
+        source=source,
+        budgets=budgets,
+        diagnostic_level=DiagnosticLevel.BASIC,
+    )
+
+    assert aggressive.compute_worker_count > conservative.compute_worker_count
+    assert aggressive.warp_worker_count > conservative.warp_worker_count
+    assert aggressive.internal_queue_depth > conservative.internal_queue_depth
+    assert aggressive.chunk_cap_frames > conservative.chunk_cap_frames
+
+
+def test_choose_scheduler_inputs_keeps_motion_estimation_serial_pending_validation() -> None:
+    source = _source(frame_count=900, width=1920, height=1080)
+    budgets = _budgets(available_ram_bytes=24 * 1024 * 1024 * 1024)
+
+    conservative = choose_scheduler_inputs(
+        intent=JobIntent(
+            phase=_intent().phase,
+            processing_resolution=Resolution(width=1920, height=1080),
+            output_resolution=Resolution(width=1920, height=1080),
+            resource_policy=ResourcePolicy.CONSERVATIVE,
+        ),
+        source=source,
+        budgets=budgets,
+        diagnostic_level=DiagnosticLevel.BASIC,
+    )
+    aggressive = choose_scheduler_inputs(
+        intent=JobIntent(
+            phase=_intent().phase,
+            processing_resolution=Resolution(width=1920, height=1080),
+            output_resolution=Resolution(width=1920, height=1080),
+            resource_policy=ResourcePolicy.AGGRESSIVE,
+        ),
+        source=source,
+        budgets=budgets,
+        diagnostic_level=DiagnosticLevel.BASIC,
+    )
+
+    assert conservative.motion_worker_count == 1
+    assert aggressive.motion_worker_count == 1

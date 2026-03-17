@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 import struct
+import time
 import zlib
 
 import numpy as np
@@ -14,6 +16,9 @@ from phase_motion_app.core.drift import DriftAssessment
 from phase_motion_app.core.models import AnalysisSettings, Resolution
 from phase_motion_app.core.models import ExclusionZone, ZoneMode, ZoneShape
 from phase_motion_app.core.quantitative_analysis import StreamingQuantitativeAnalyzer
+from phase_motion_app.core.quantitative_analysis import (
+    BackgroundStreamingQuantitativeAnalyzer,
+)
 
 
 def _synthetic_motion_frames() -> np.ndarray:
@@ -109,6 +114,185 @@ def test_quantitative_analysis_writes_required_artifacts(tmp_path: Path) -> None
     assert bool(np.any(grayscale_pixels))
     assert bool(np.any(colored_pixels))
     assert np.unique(footer_region.reshape(-1, 3), axis=0).shape[0] > 10
+
+
+def test_background_quantitative_analysis_finalizes_after_bounded_handoff(
+    tmp_path: Path,
+) -> None:
+    frames = _synthetic_motion_frames()
+    reference_luma = frames.mean(axis=0, dtype=np.float32)[..., 1]
+    background = BackgroundStreamingQuantitativeAnalyzer(
+        StreamingQuantitativeAnalyzer(
+            settings=AnalysisSettings(export_advanced_files=False),
+            processing_resolution=Resolution(32, 32),
+            fps=12.0,
+            low_hz=1.0,
+            high_hz=4.0,
+            reference_luma=reference_luma,
+            exclusion_zones=(),
+            drift_assessment=DriftAssessment(),
+        ),
+        queue_depth=1,
+    )
+
+    try:
+        background.add_chunk(frames[:8])
+        background.add_chunk(frames[8:])
+        export = background.finalize(tmp_path)
+    finally:
+        background.close()
+
+    assert export.summary["status"] == "completed"
+    assert (tmp_path / "roi_metrics.csv").exists()
+    assert (tmp_path / "roi_spectrum.json").exists()
+
+
+def test_background_quantitative_analysis_surfaces_worker_failure(tmp_path: Path) -> None:
+    class _BrokenAnalyzer:
+        def add_chunk(self, _frames_rgb: np.ndarray) -> None:
+            raise RuntimeError("analysis exploded")
+
+        def finalize(self, _output_directory: Path):
+            raise AssertionError("finalize should not run after collection failure")
+
+    background = BackgroundStreamingQuantitativeAnalyzer(
+        _BrokenAnalyzer(),
+        queue_depth=1,
+    )
+
+    try:
+        background.add_chunk(np.zeros((2, 4, 4, 3), dtype=np.float32))
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                background.finalize(tmp_path)
+            except RuntimeError as exc:
+                assert "Background quantitative analysis failed." in str(exc)
+                return
+            time.sleep(0.05)
+        raise AssertionError("background failure did not surface in time")
+    finally:
+        background.close()
+
+
+def test_quantitative_analysis_confidence_weight_is_chunk_partition_invariant(
+    tmp_path: Path,
+) -> None:
+    analyzer_a = StreamingQuantitativeAnalyzer(
+        settings=AnalysisSettings(export_advanced_files=False),
+        processing_resolution=Resolution(32, 32),
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=4.0,
+        reference_luma=np.zeros((32, 32), dtype=np.float32),
+        exclusion_zones=(),
+        drift_assessment=DriftAssessment(),
+    )
+    analyzer_b = StreamingQuantitativeAnalyzer(
+        settings=AnalysisSettings(export_advanced_files=False),
+        processing_resolution=Resolution(32, 32),
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=4.0,
+        reference_luma=np.zeros((32, 32), dtype=np.float32),
+        exclusion_zones=(),
+        drift_assessment=DriftAssessment(),
+    )
+
+    row_count = len(analyzer_a._layout.row_starts)
+    column_count = len(analyzer_a._layout.column_starts)
+
+    def fake_analyze_chunk(frames_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        frame_count = frames_rgb.shape[0]
+        motion_shape = (frame_count, row_count, column_count)
+        confidence = np.full(
+            (row_count, column_count),
+            float(frame_count),
+            dtype=np.float32,
+        )
+        return (
+            np.zeros(motion_shape, dtype=np.float32),
+            np.zeros(motion_shape, dtype=np.float32),
+            confidence,
+        )
+
+    analyzer_a._motion_analyzer.analyze_chunk = fake_analyze_chunk  # type: ignore[method-assign]
+    analyzer_b._motion_analyzer.analyze_chunk = fake_analyze_chunk  # type: ignore[method-assign]
+
+    analyzer_a.add_chunk(np.zeros((6, 32, 32, 3), dtype=np.float32))
+    analyzer_a.add_chunk(np.zeros((4, 32, 32, 3), dtype=np.float32))
+
+    analyzer_b.add_chunk(np.zeros((4, 32, 32, 3), dtype=np.float32))
+    analyzer_b.add_chunk(np.zeros((4, 32, 32, 3), dtype=np.float32))
+    analyzer_b.add_chunk(np.zeros((2, 32, 32, 3), dtype=np.float32))
+
+    analyzer_a.finalize(tmp_path / "confidence-a")
+    analyzer_b.finalize(tmp_path / "confidence-b")
+
+    confidence_a = analyzer_a._confidence_sum / analyzer_a._confidence_frame_weight
+    confidence_b = analyzer_b._confidence_sum / analyzer_b._confidence_frame_weight
+
+    assert analyzer_a._frame_count == analyzer_b._frame_count == 10
+    assert analyzer_a._confidence_frame_weight == analyzer_b._confidence_frame_weight == 10
+    assert np.allclose(confidence_a, confidence_b, atol=1e-6)
+
+
+def test_quantitative_analysis_export_is_invariant_to_render_chunk_boundaries(
+    tmp_path: Path,
+) -> None:
+    frames = np.zeros((26, 32, 32, 3), dtype=np.float32)
+    np.random.seed(3)
+    for frame_index in range(frames.shape[0]):
+        phase = frame_index / float(frames.shape[0] - 1)
+        frames[
+            frame_index,
+            4:20,
+            int(4 + phase * 8) : int(12 + phase * 8),
+            :,
+        ] = 0.8
+        if frame_index >= 18:
+            frames[frame_index] += (
+                np.random.rand(32, 32, 3).astype(np.float32) - 0.5
+            ) * 0.2
+    frames = np.clip(frames, 0.0, 1.0)
+    reference_luma = frames.mean(axis=0, dtype=np.float32)[..., 1]
+
+    def run_export(subdir: str, splits: tuple[int, ...]) -> tuple[dict, list[list[str]]]:
+        output_dir = tmp_path / subdir
+        analyzer = StreamingQuantitativeAnalyzer(
+            settings=AnalysisSettings(export_advanced_files=False),
+            processing_resolution=Resolution(32, 32),
+            fps=12.0,
+            low_hz=1.0,
+            high_hz=4.0,
+            reference_luma=reference_luma,
+            exclusion_zones=(),
+            drift_assessment=DriftAssessment(),
+        )
+        start = 0
+        for count in splits:
+            analyzer.add_chunk(frames[start : start + count])
+            start += count
+        export = analyzer.finalize(output_dir)
+        heatmap_csv_path = Path(
+            next(
+                path
+                for key, path in export.artifact_paths.items()
+                if key.startswith("heatmap_") and key.endswith("_csv")
+            )
+        )
+        with heatmap_csv_path.open("r", encoding="utf-8", newline="") as handle:
+            heatmap_rows = list(csv.reader(handle))
+        summary = dict(export.summary)
+        summary["artifact_paths"] = {}
+        return summary, heatmap_rows
+
+    split_a_summary, split_a_heatmap = run_export("split-a", (20, 6))
+    split_b_summary, split_b_heatmap = run_export("split-b", (8, 8, 8, 2))
+    split_c_summary, split_c_heatmap = run_export("split-c", (24, 2))
+
+    assert split_a_summary == split_b_summary == split_c_summary
+    assert split_a_heatmap == split_b_heatmap == split_c_heatmap
 
 
 def test_quantitative_analysis_whole_frame_fallback_respects_processing_mask() -> None:
@@ -327,6 +511,157 @@ def test_heatmap_overlay_fades_weak_absolute_band_activity() -> None:
     )
 
     assert float(overlay_alpha[0, 1]) > float(overlay_alpha[0, 0])
+
+
+def test_heatmap_overlay_fades_lower_confidence_cells_even_when_band_energy_matches() -> None:
+    base_cells = [
+        quantitative_analysis_module._BaseCell(
+            cell_id="hm_r01_c01",
+            row_index=0,
+            column_index=0,
+            start_x=0,
+            start_y=0,
+            width=8,
+            height=8,
+            center_x=4.0,
+            center_y=4.0,
+            roi_fraction=1.0,
+            usable_fraction=1.0,
+            excluded_fraction=0.0,
+            roi_cell_id="cell_r01_c01",
+        ),
+        quantitative_analysis_module._BaseCell(
+            cell_id="hm_r01_c02",
+            row_index=0,
+            column_index=1,
+            start_x=8,
+            start_y=0,
+            width=8,
+            height=8,
+            center_x=12.0,
+            center_y=4.0,
+            roi_fraction=1.0,
+            usable_fraction=1.0,
+            excluded_fraction=0.0,
+            roi_cell_id="cell_r01_c02",
+        ),
+        quantitative_analysis_module._BaseCell(
+            cell_id="hm_r01_c03",
+            row_index=0,
+            column_index=2,
+            start_x=16,
+            start_y=0,
+            width=8,
+            height=8,
+            center_x=20.0,
+            center_y=4.0,
+            roi_fraction=1.0,
+            usable_fraction=1.0,
+            excluded_fraction=0.0,
+            roi_cell_id="cell_r01_c03",
+        ),
+    ]
+    base_spectra = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.50, 0.50, 0.10],
+            [0.10, 0.10, 0.02],
+        ],
+        dtype=np.float32,
+    )
+    heatmaps, _scale = quantitative_analysis_module._build_heatmaps(
+        base_cells=base_cells,
+        base_spectra=base_spectra,
+        confidence_mean=np.array([0.40, 0.95, 0.95], dtype=np.float32),
+        frequencies=np.array([0.0, 1.0, 2.0], dtype=np.float32),
+        bands=(
+            quantitative_analysis_module._GeneratedBand(
+                band_id="band01",
+                low_hz=0.5,
+                high_hz=1.5,
+                mode="auto",
+                source_peak_hz=1.0,
+            ),
+        ),
+        low_confidence_threshold=0.35,
+    )
+
+    heatmap = heatmaps["band01"]
+
+    assert float(heatmap["grid"][0, 0]) == float(heatmap["grid"][0, 1])
+    assert float(heatmap["band_salience_grid"][0, 2]) < float(
+        heatmap["band_salience_grid"][0, 0]
+    )
+    assert float(heatmap["band_salience_grid"][0, 1]) > float(
+        heatmap["band_salience_grid"][0, 0]
+    )
+
+    _overlay_rgb, overlay_alpha = quantitative_analysis_module._build_heatmap_overlay_grid(
+        grid=heatmap["grid"],
+        band_salience_grid=heatmap["band_salience_grid"],
+        low_confidence_mask=heatmap["low_confidence_mask"],
+        display_min=0.0,
+        display_max=1.0,
+    )
+
+    assert float(overlay_alpha[0, 1]) > float(overlay_alpha[0, 0])
+
+
+def test_visible_content_mask_suppresses_pillarbox_bars() -> None:
+    frame = np.zeros((32, 48, 3), dtype=np.float32)
+    frame[:, 10:38, :] = 0.6
+
+    mask = quantitative_analysis_module._build_visible_content_mask(
+        frame,
+        target_height=32,
+        target_width=48,
+    )
+
+    assert mask.shape == (32, 48)
+    assert float(mask[:, :8].max()) == 0.0
+    assert float(mask[:, -8:].max()) == 0.0
+    assert float(mask[:, 14:34].min()) == 1.0
+
+
+def test_resolve_bands_clamps_out_of_range_auto_peaks_to_requested_window() -> None:
+    frequencies = np.arange(0.0, 1.6, 0.1, dtype=np.float32)
+    roi_spectrum = np.array(
+        [0.0, 0.02, 0.04, 0.30, 0.22, 0.08, 0.05, 0.18, 0.03, 0.20, 0.02, 0.18, 0.01, 0.16, 0.01, 0.12],
+        dtype=np.float32,
+    )
+
+    bands, _merge_steps = quantitative_analysis_module._resolve_bands(
+        settings=AnalysisSettings(auto_band_count=5),
+        roi_spectrum=roi_spectrum,
+        frequencies=frequencies,
+        reported_peaks=(
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=0.30,
+                amplitude=0.30,
+                support_fraction=0.7,
+                ranking_score=0.9,
+            ),
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=0.70,
+                amplitude=0.18,
+                support_fraction=0.5,
+                ranking_score=0.5,
+            ),
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=1.20,
+                amplitude=0.20,
+                support_fraction=0.5,
+                ranking_score=0.5,
+            ),
+        ),
+        low_hz=0.15,
+        high_hz=0.45,
+    )
+
+    assert bands
+    assert all(0.15 <= band.low_hz <= 0.45 for band in bands)
+    assert all(0.15 <= band.high_hz <= 0.45 for band in bands)
+    assert all(band.low_hz <= band.high_hz for band in bands)
 
 
 def test_auto_band_resolution_keeps_valley_separated_peaks_distinct() -> None:

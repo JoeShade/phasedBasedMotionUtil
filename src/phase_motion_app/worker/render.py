@@ -45,6 +45,7 @@ from phase_motion_app.core.media_tools import (
 from phase_motion_app.core.models import ObservedEnvironment, PreflightSummary, SourceRecord
 from phase_motion_app.core.phase_engine import StreamingPhaseAmplifier
 from phase_motion_app.core.quantitative_analysis import (
+    BackgroundStreamingQuantitativeAnalyzer,
     StreamingQuantitativeAnalyzer,
     build_disabled_analysis_export,
     build_empty_analysis_export,
@@ -86,6 +87,27 @@ class _ThreadSafeConnection:
     def send(self, message: dict) -> None:
         with self._lock:
             self.connection.send(message)
+
+    def send_session_message(
+        self,
+        *,
+        config: SessionConfig,
+        sequence: "_SharedSequence",
+        message_type: str,
+        payload: dict | None,
+    ) -> None:
+        """Allocate the sequence number under the same lock as the socket write so concurrent worker threads cannot reorder protocol messages."""
+
+        with self._lock:
+            self.connection.send(
+                build_message(
+                    config=config,
+                    seq=sequence.next(),
+                    message_type=message_type,
+                    monotonic_time_ns=time.monotonic_ns(),
+                    payload=payload,
+                )
+            )
 
 
 class _SharedSequence:
@@ -132,7 +154,7 @@ class _PipelineFailure:
 
 
 _PIPELINE_SENTINEL = object()
-_PIPELINE_QUEUE_DEPTH = 1
+_DEFAULT_PIPELINE_QUEUE_DEPTH = 1
 
 
 def _queue_put_with_cancel(
@@ -171,6 +193,69 @@ def _queue_get_with_cancel(
             return work_queue.get(timeout=timeout_seconds)
         except queue.Empty:
             continue
+
+
+def _effective_thread_limits_from_scheduler(
+    scheduler: SchedulerInputs | None,
+) -> dict[str, int]:
+    """Keep runtime thread accounting in one place so diagnostics and sidecars report the same applied helper counts."""
+
+    if scheduler is None:
+        return {
+            "python_compute_coordinator_threads": 1,
+            "python_compute_helper_threads": 1,
+            "python_motion_worker_threads": 1,
+            "python_warp_worker_threads": 1,
+            "python_pipeline_stage_threads": 3,
+            "python_heartbeat_threads": 1,
+        }
+
+    limits = {
+        # The coordinator thread keeps chunk order and temporal filter state authoritative.
+        "python_compute_coordinator_threads": 1,
+        # Helper counts stay separate so diagnostics can show which sub-stage actually fans out.
+        "python_compute_helper_threads": max(scheduler.compute_worker_count, 1),
+        "python_motion_worker_threads": max(scheduler.motion_worker_count, 1),
+        "python_warp_worker_threads": max(scheduler.warp_worker_count, 1),
+        "python_pipeline_stage_threads": 3,
+        "python_heartbeat_threads": 1,
+    }
+    if scheduler.analyzer_mode.value == "background_thread":
+        limits["python_analysis_threads"] = 1
+    return limits
+
+
+def _scheduler_payload_from_inputs(scheduler: SchedulerInputs | None) -> dict[str, Any]:
+    """Keep the applied runtime-plan snapshot explicit so diagnostics show what the worker actually used."""
+
+    queue_depth = (
+        _DEFAULT_PIPELINE_QUEUE_DEPTH
+        if scheduler is None
+        else scheduler.internal_queue_depth
+    )
+    return {
+        "chunk_frames": None if scheduler is None else scheduler.chunk_frames,
+        "chunk_cap_frames": None if scheduler is None else scheduler.chunk_cap_frames,
+        "chunk_target_ram_fraction": None
+        if scheduler is None
+        else scheduler.chunk_target_ram_fraction,
+        "thread_limit": None if scheduler is None else scheduler.thread_limit,
+        "precision_bytes": None if scheduler is None else scheduler.precision_bytes,
+        "decode_pass_count": 2,
+        "pipeline_mode": "two_pass_bounded_threaded_pipeline",
+        "internal_queue_depth": queue_depth,
+        "analyzer_queue_depth": None if scheduler is None else scheduler.analysis_queue_depth,
+        "compute_worker_count": None
+        if scheduler is None
+        else scheduler.compute_worker_count,
+        "warp_worker_count": None if scheduler is None else scheduler.warp_worker_count,
+        "motion_worker_count": None
+        if scheduler is None
+        else scheduler.motion_worker_count,
+        "analyzer_mode": None if scheduler is None else scheduler.analyzer_mode.value,
+        "ffmpeg_thread_args": ["-threads", "1"],
+        "effective_thread_limits": _effective_thread_limits_from_scheduler(scheduler),
+    }
 
 
 def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventType) -> None:
@@ -229,20 +314,19 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
     diagnostics_bundle_path = request.paths.diagnostics_directory / "diagnostics_bundle.json"
     analysis_export = build_disabled_analysis_export(request.intent.analysis)
     analysis_collection_warning: str | None = None
+    phase_amplifier: StreamingPhaseAmplifier | None = None
+    analysis_analyzer: Any | None = None
 
     def emit(message_type: str, payload: dict | None = None) -> None:
         nonlocal last_emitted_message_type, last_progress_token
         last_emitted_message_type = message_type
         if payload is not None and isinstance(payload.get("progress_token"), int):
             last_progress_token = payload["progress_token"]
-        safe_connection.send(
-            build_message(
-                config=session,
-                seq=sequence.next(),
-                message_type=message_type,
-                monotonic_time_ns=time.monotonic_ns(),
-                payload=payload,
-            )
+        safe_connection.send_session_message(
+            config=session,
+            sequence=sequence,
+            message_type=message_type,
+            payload=payload,
         )
 
     def log(level: str, event_type: str, stage: str, message: str, payload: dict | None = None) -> None:
@@ -550,6 +634,8 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             magnification=request.intent.phase.magnification,
             sigma=request.intent.phase.sigma,
             attenuate_other_frequencies=request.intent.phase.attenuate_other_frequencies,
+            warp_worker_count=scheduler.warp_worker_count,
+            motion_worker_count=scheduler.motion_worker_count,
         )
         analysis_analyzer = None
         if request.intent.analysis.enabled:
@@ -564,6 +650,14 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                     exclusion_zones=request.intent.exclusion_zones,
                     drift_assessment=request.drift_assessment,
                 )
+                if scheduler.analyzer_mode.value == "background_thread":
+                    # The helper thread gets a bounded queue so analysis can lag
+                    # slightly behind compute without quietly growing without limit.
+                    analysis_analyzer = BackgroundStreamingQuantitativeAnalyzer(
+                        analysis_analyzer,
+                        queue_depth=scheduler.analysis_queue_depth,
+                        cancel_check=cancel_event.is_set,
+                    )
             except Exception as exc:
                 analysis_collection_warning = (
                     "Quantitative analysis could not be initialized and was disabled for "
@@ -611,8 +705,9 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
         pipeline_failure: _PipelineFailure | None = None
         pipeline_failure_lock = threading.Lock()
         progress_lock = threading.Lock()
-        decoded_queue: queue.Queue = queue.Queue(maxsize=_PIPELINE_QUEUE_DEPTH)
-        encoded_queue: queue.Queue = queue.Queue(maxsize=_PIPELINE_QUEUE_DEPTH)
+        pipeline_queue_depth = max(scheduler.internal_queue_depth, 1)
+        decoded_queue: queue.Queue = queue.Queue(maxsize=pipeline_queue_depth)
+        encoded_queue: queue.Queue = queue.Queue(maxsize=pipeline_queue_depth)
         source_frame_size = source_resolution.width * source_resolution.height * 3
         output_frame_size = (
             request.intent.output_resolution.width
@@ -938,7 +1033,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                 "stage_started",
                 "encode",
                 "Waiting for the bounded encoder queue to drain and the ffmpeg encoder to exit.",
-                {"internal_queue_depth": _PIPELINE_QUEUE_DEPTH},
+                {"internal_queue_depth": pipeline_queue_depth},
             )
             while encode_thread.is_alive():
                 if cancel_event.is_set():
@@ -1067,6 +1162,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             working_probe=working_probe,
             fingerprint=fingerprint,
             preflight=preflight,
+            scheduler=scheduler,
             codec_plan=codec_plan,
             normalization_plan=normalization_plan,
             normalized_source_path=normalized_source_path,
@@ -1167,6 +1263,26 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             time.monotonic() - current_stage_started_at,
             0.0,
         )
+        if phase_amplifier is not None:
+            try:
+                phase_amplifier.close()
+            except Exception:
+                log(
+                    "warning",
+                    "phase_amplifier_cleanup_failed",
+                    current_stage,
+                    "The worker could not fully close the phase helper pool during teardown.",
+                )
+        if analysis_analyzer is not None and hasattr(analysis_analyzer, "close"):
+            try:
+                analysis_analyzer.close()
+            except Exception:
+                log(
+                    "warning",
+                    "analysis_cleanup_failed",
+                    current_stage,
+                    "The worker could not fully close the background analysis helper during teardown.",
+                )
         _write_bundle_if_possible(
             request=request,
             diagnostics_bundle_path=diagnostics_bundle_path,
@@ -1316,20 +1432,7 @@ def _write_bundle_if_possible(
                 "output_staging_required_bytes": preflight.output_staging_required_bytes,
             }
         )
-    scheduler_payload = {
-        "chunk_frames": None if scheduler is None else scheduler.chunk_frames,
-        "thread_limit": None if scheduler is None else scheduler.thread_limit,
-        "precision_bytes": None if scheduler is None else scheduler.precision_bytes,
-        "decode_pass_count": 2,
-        "pipeline_mode": "two_pass_bounded_threaded_pipeline",
-        "internal_queue_depth": _PIPELINE_QUEUE_DEPTH,
-        "ffmpeg_thread_args": ["-threads", "1"],
-        "effective_thread_limits": {
-            "python_worker_compute": 1,
-            "python_pipeline_stage_threads": 3,
-            "python_heartbeat_threads": 1,
-        },
-    }
+    scheduler_payload = _scheduler_payload_from_inputs(scheduler)
     memory_payload = {
         "available_ram_bytes": None if budgets is None else budgets.available_ram_bytes,
         "reserved_ui_headroom_bytes": None
@@ -1548,6 +1651,7 @@ def _build_sidecar_payload(
     working_probe,
     fingerprint: str,
     preflight,
+    scheduler: SchedulerInputs | None,
     codec_plan: CodecPlan,
     normalization_plan: SourceNormalizationPlan | None,
     normalized_source_path: Path | None,
@@ -1565,12 +1669,8 @@ def _build_sidecar_payload(
         temp_root=str(request.paths.scratch_directory.parent),
         ffmpeg_version=_query_tool_version(toolchain.ffmpeg),
         ffprobe_version=_query_tool_version(toolchain.ffprobe),
-        scheduler_clamp_threads=1,
-        effective_thread_limits={
-            "python_worker_compute": 1,
-            "python_pipeline_stage_threads": 3,
-            "python_heartbeat_threads": 1,
-        },
+        scheduler_clamp_threads=None if scheduler is None else scheduler.thread_limit,
+        effective_thread_limits=_effective_thread_limits_from_scheduler(scheduler),
     )
     preflight_summary = PreflightSummary(
         source_fps=probe.avg_fps or probe.fps or 1.0,

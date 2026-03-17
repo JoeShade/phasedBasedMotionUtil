@@ -6,8 +6,11 @@ import binascii
 import csv
 import json
 import math
+import queue
 import struct
+import threading
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,7 +31,7 @@ from phase_motion_app.core.phase_engine import (
     _StreamingBandpassFilter,
     _build_motion_reference_from_layout,
     _estimate_local_phase_shifts_against_reference,
-    _normalize_confidence,
+    _normalize_analysis_confidence,
     _rgb_to_luma,
 )
 
@@ -118,6 +121,10 @@ class _GeneratedBand:
         }
 
 
+_ANALYSIS_QUEUE_SENTINEL = object()
+_ANALYSIS_INTERNAL_BATCH_FRAMES = 8
+
+
 class _StreamingMotionFieldAnalyzer:
     """This helper runs the same local motion backend as the render engine on an independent grid that feeds ROI spectra and heatmaps."""
 
@@ -168,12 +175,110 @@ class _StreamingMotionFieldAnalyzer:
             phase_motion_y = bandpassed_y + np.float32(0.25) * (
                 displacement_y - displacement_y.mean(axis=0, dtype=np.float32)
             )
-        confidence_scale = _normalize_confidence(confidence)
+        # Quantitative analysis needs a gentler transfer than the render warp so
+        # coherent medium-confidence motion still shows up in the exported
+        # traces, ROI quality, and heatmaps.
+        confidence_scale = _normalize_analysis_confidence(confidence)
         return (
             phase_motion_x * confidence_scale[None, :, :],
             phase_motion_y * confidence_scale[None, :, :],
             confidence_scale,
         )
+
+
+class BackgroundStreamingQuantitativeAnalyzer:
+    """This helper moves chunk collection onto one bounded background thread so render-time analysis does not sit directly on the phase-processing critical path."""
+
+    def __init__(
+        self,
+        analyzer: "StreamingQuantitativeAnalyzer",
+        *,
+        queue_depth: int,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> None:
+        self._analyzer = analyzer
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(queue_depth)))
+        self._cancel_check = cancel_check
+        self._failure: BaseException | None = None
+        self._failure_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="quantitative-analysis-background",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def add_chunk(self, frames_rgb: np.ndarray) -> None:
+        """Queue one chunk copy for background analysis so the caller keeps ownership of the hot-path working buffers."""
+
+        if frames_rgb.shape[0] == 0:
+            return
+        self._raise_if_failed()
+        queued_chunk = frames_rgb.astype(np.float32, copy=True)
+        while True:
+            if self._closed.is_set():
+                self._raise_if_failed()
+                raise RuntimeError("Background quantitative analysis is already closed.")
+            if self._cancel_check is not None and self._cancel_check():
+                raise RuntimeError("Background quantitative analysis was cancelled.")
+            try:
+                self._queue.put(queued_chunk, timeout=0.05)
+                return
+            except queue.Full:
+                self._raise_if_failed()
+                continue
+
+    def finalize(self, output_directory: Path) -> QuantitativeAnalysisExport:
+        """Drain queued work before exporting so the final artifact set still reflects every accepted chunk in order."""
+
+        self._close_worker()
+        self._raise_if_failed()
+        return self._analyzer.finalize(output_directory)
+
+    def close(self) -> None:
+        """Stop the helper thread without writing artifacts so cancellation and worker teardown do not leak threads."""
+
+        self._close_worker()
+
+    def _close_worker(self) -> None:
+        if self._closed.is_set():
+            if self._thread.is_alive():
+                self._thread.join(timeout=1.0)
+            return
+        self._closed.set()
+        while self._thread.is_alive():
+            try:
+                self._queue.put(_ANALYSIS_QUEUE_SENTINEL, timeout=0.05)
+                break
+            except queue.Full:
+                self._raise_if_failed()
+                continue
+        self._thread.join(timeout=10.0)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                try:
+                    item = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    if self._closed.is_set():
+                        return
+                    continue
+                if item is _ANALYSIS_QUEUE_SENTINEL:
+                    return
+                self._analyzer.add_chunk(item)
+        except BaseException as exc:
+            with self._failure_lock:
+                self._failure = exc
+            self._closed.set()
+
+    def _raise_if_failed(self) -> None:
+        with self._failure_lock:
+            failure = self._failure
+        if failure is None:
+            return
+        raise RuntimeError("Background quantitative analysis failed.") from failure
 
 
 class StreamingQuantitativeAnalyzer:
@@ -223,9 +328,10 @@ class StreamingQuantitativeAnalyzer:
         self._x_chunks: list[np.ndarray] = []
         self._y_chunks: list[np.ndarray] = []
         self._confidence_sum = np.zeros(len(self._base_cells), dtype=np.float64)
-        self._confidence_updates = 0
+        self._confidence_frame_weight = 0
         self._frame_count = 0
         self._representative_still_frame_rgb: np.ndarray | None = None
+        self._pending_frames_rgb: np.ndarray | None = None
         self._fallback_still_frame_rgb = np.repeat(
             np.clip(reference_luma[:, :, None], 0.0, 1.0),
             3,
@@ -235,23 +341,41 @@ class StreamingQuantitativeAnalyzer:
     def add_chunk(self, frames_rgb: np.ndarray) -> None:
         """Accumulate one bounded processing chunk so the final analysis still runs alongside the authoritative render path."""
 
+        if frames_rgb.shape[0] == 0:
+            return
         if self._representative_still_frame_rgb is None and frames_rgb.shape[0] > 0:
             self._representative_still_frame_rgb = frames_rgb[0].astype(
                 np.float32,
                 copy=True,
             )
-        motion_x, motion_y, confidence = self._motion_analyzer.analyze_chunk(frames_rgb)
-        frame_count = motion_x.shape[0]
-        self._x_chunks.append(motion_x.reshape(frame_count, -1))
-        self._y_chunks.append(motion_y.reshape(frame_count, -1))
-        self._confidence_sum += confidence.reshape(-1).astype(np.float64, copy=False)
-        self._confidence_updates += 1
-        self._frame_count += frame_count
+        incoming = frames_rgb.astype(np.float32, copy=False)
+        if self._pending_frames_rgb is not None and self._pending_frames_rgb.shape[0] > 0:
+            # Keep one tiny carry-over buffer so analysis uses one fixed internal
+            # batch cadence even when the render pipeline changes its chunk size.
+            incoming = np.concatenate((self._pending_frames_rgb, incoming), axis=0)
+            self._pending_frames_rgb = None
+
+        processed_frame_count = 0
+        while (incoming.shape[0] - processed_frame_count) >= _ANALYSIS_INTERNAL_BATCH_FRAMES:
+            batch = incoming[
+                processed_frame_count : processed_frame_count + _ANALYSIS_INTERNAL_BATCH_FRAMES
+            ]
+            self._accumulate_processed_chunk(batch)
+            processed_frame_count += _ANALYSIS_INTERNAL_BATCH_FRAMES
+
+        if processed_frame_count < incoming.shape[0]:
+            self._pending_frames_rgb = incoming[processed_frame_count:].astype(
+                np.float32,
+                copy=True,
+            )
 
     def finalize(self, output_directory: Path) -> QuantitativeAnalysisExport:
         """Compute the ROI-level outputs and write the fixed artifact filenames once the render has otherwise completed."""
 
         output_directory.mkdir(parents=True, exist_ok=True)
+        if self._pending_frames_rgb is not None and self._pending_frames_rgb.shape[0] > 0:
+            self._accumulate_processed_chunk(self._pending_frames_rgb)
+            self._pending_frames_rgb = None
         if self._frame_count == 0 or not self._base_cells:
             return build_empty_analysis_export(
                 roi=self._roi,
@@ -264,7 +388,7 @@ class StreamingQuantitativeAnalyzer:
         x_traces = np.concatenate(self._x_chunks, axis=0)
         y_traces = np.concatenate(self._y_chunks, axis=0)
         confidence_mean = (
-            self._confidence_sum / max(self._confidence_updates, 1)
+            self._confidence_sum / max(self._confidence_frame_weight, 1)
         ).astype(np.float32, copy=False)
         frequencies = _frequency_axis(self._frame_count, self._fps)
 
@@ -379,6 +503,19 @@ class StreamingQuantitativeAnalyzer:
             artifact_paths=artifact_paths,
             warnings=tuple(roi_quality["warnings"]),
         )
+
+    def _accumulate_processed_chunk(self, frames_rgb: np.ndarray) -> None:
+        """Process one fixed internal analysis batch so heatmaps depend on source motion, not render chunk boundaries."""
+
+        motion_x, motion_y, confidence = self._motion_analyzer.analyze_chunk(frames_rgb)
+        frame_count = motion_x.shape[0]
+        self._x_chunks.append(motion_x.reshape(frame_count, -1))
+        self._y_chunks.append(motion_y.reshape(frame_count, -1))
+        self._confidence_sum += (
+            confidence.reshape(-1).astype(np.float64, copy=False) * frame_count
+        )
+        self._confidence_frame_weight += frame_count
+        self._frame_count += frame_count
 
 
 def build_disabled_analysis_export(settings: AnalysisSettings) -> QuantitativeAnalysisExport:
@@ -1178,12 +1315,16 @@ def _resolve_bands(
         manual_bands = settings.manual_bands[:1]
         return (
             tuple(
-                _GeneratedBand(
-                    band_id=band.band_id,
-                    low_hz=band.low_hz,
-                    high_hz=band.high_hz,
-                    mode=settings.band_mode.value,
-                    source_peak_hz=None,
+                _clamp_generated_band_to_requested_range(
+                    _GeneratedBand(
+                        band_id=band.band_id,
+                        low_hz=band.low_hz,
+                        high_hz=band.high_hz,
+                        mode=settings.band_mode.value,
+                        source_peak_hz=None,
+                    ),
+                    low_hz=low_hz,
+                    high_hz=high_hz,
                 )
                 for band in manual_bands
             ),
@@ -1192,22 +1333,34 @@ def _resolve_bands(
     if settings.band_mode is AnalysisBandMode.MANUAL_MULTI:
         return (
             tuple(
-                _GeneratedBand(
-                    band_id=band.band_id,
-                    low_hz=band.low_hz,
-                    high_hz=band.high_hz,
-                    mode=settings.band_mode.value,
-                    source_peak_hz=None,
+                _clamp_generated_band_to_requested_range(
+                    _GeneratedBand(
+                        band_id=band.band_id,
+                        low_hz=band.low_hz,
+                        high_hz=band.high_hz,
+                        mode=settings.band_mode.value,
+                        source_peak_hz=None,
+                    ),
+                    low_hz=low_hz,
+                    high_hz=high_hz,
                 )
                 for band in settings.manual_bands[:5]
             ),
             (),
         )
 
-    candidate_frequencies = [peak.frequency_hz for peak in reported_peaks]
+    candidate_frequencies = [
+        peak.frequency_hz
+        for peak in reported_peaks
+        if low_hz <= peak.frequency_hz <= high_hz
+    ]
     if not candidate_frequencies:
         peak_indices = _find_peak_indices(roi_spectrum, frequencies)
-        candidate_frequencies = [float(frequencies[index]) for index in peak_indices]
+        candidate_frequencies = [
+            float(frequencies[index])
+            for index in peak_indices
+            if low_hz <= float(frequencies[index]) <= high_hz
+        ]
     bands: list[_GeneratedBand] = []
     merge_steps: list[str] = []
     for band_number, peak_hz in enumerate(candidate_frequencies[: settings.auto_band_count], start=1):
@@ -1219,12 +1372,16 @@ def _resolve_bands(
             high_hz=high_hz,
         )
         bands.append(
-            _GeneratedBand(
-                band_id=f"band{band_number:02d}",
-                low_hz=low_edge,
-                high_hz=high_edge,
-                mode=settings.band_mode.value,
-                source_peak_hz=peak_hz,
+            _clamp_generated_band_to_requested_range(
+                _GeneratedBand(
+                    band_id=f"band{band_number:02d}",
+                    low_hz=low_edge,
+                    high_hz=high_edge,
+                    mode=settings.band_mode.value,
+                    source_peak_hz=peak_hz,
+                ),
+                low_hz=low_hz,
+                high_hz=high_hz,
             )
         )
     if not bands:
@@ -1232,12 +1389,16 @@ def _resolve_bands(
         center = low_hz + (span / 2.0)
         half_width = min(0.5, span / 2.0)
         bands.append(
-            _GeneratedBand(
-                band_id="band01",
-                low_hz=max(low_hz, center - half_width),
-                high_hz=min(high_hz, center + half_width),
-                mode=settings.band_mode.value,
-                source_peak_hz=center,
+            _clamp_generated_band_to_requested_range(
+                _GeneratedBand(
+                    band_id="band01",
+                    low_hz=max(low_hz, center - half_width),
+                    high_hz=min(high_hz, center + half_width),
+                    mode=settings.band_mode.value,
+                    source_peak_hz=center,
+                ),
+                low_hz=low_hz,
+                high_hz=high_hz,
             )
         )
     bands = _split_auto_bands_at_clear_valleys(
@@ -1245,6 +1406,14 @@ def _resolve_bands(
         roi_spectrum=roi_spectrum,
         frequencies=frequencies,
     )
+    bands = [
+        _clamp_generated_band_to_requested_range(
+            band,
+            low_hz=low_hz,
+            high_hz=high_hz,
+        )
+        for band in bands
+    ]
     merged: list[_GeneratedBand] = []
     for band in sorted(bands, key=lambda item: item.low_hz):
         if not merged:
@@ -1272,6 +1441,34 @@ def _resolve_bands(
             continue
         merged.append(band)
     return tuple(merged[: settings.auto_band_count]), tuple(merge_steps)
+
+
+def _clamp_generated_band_to_requested_range(
+    band: _GeneratedBand,
+    *,
+    low_hz: float,
+    high_hz: float,
+) -> _GeneratedBand:
+    """Clamp one generated band to the selected phase window so sidecar metadata and heatmap exports never describe impossible ranges."""
+
+    if high_hz < low_hz:
+        high_hz = low_hz
+    clamped_low = float(np.clip(band.low_hz, low_hz, high_hz))
+    clamped_high = float(np.clip(band.high_hz, low_hz, high_hz))
+    if clamped_high < clamped_low:
+        center = band.source_peak_hz
+        if center is None:
+            center = low_hz
+        center = float(np.clip(center, low_hz, high_hz))
+        clamped_low = center
+        clamped_high = center
+    return _GeneratedBand(
+        band_id=band.band_id,
+        low_hz=clamped_low,
+        high_hz=clamped_high,
+        mode=band.mode,
+        source_peak_hz=band.source_peak_hz,
+    )
 
 
 def _split_auto_bands_at_clear_valleys(
@@ -1406,6 +1603,7 @@ def _build_heatmaps(
     for band in bands:
         grid = np.full((grid_rows, grid_columns), np.nan, dtype=np.float32)
         band_energy_grid = np.full((grid_rows, grid_columns), np.nan, dtype=np.float32)
+        confidence_grid = np.zeros((grid_rows, grid_columns), dtype=np.float32)
         low_confidence_mask = np.zeros((grid_rows, grid_columns), dtype=bool)
         reason_summary = {
             "outside_roi": 0,
@@ -1418,6 +1616,9 @@ def _build_heatmaps(
             if cell.roi_fraction <= 0:
                 reason_summary["outside_roi"] += 1
                 continue
+            confidence_grid[cell.row_index, cell.column_index] = np.float32(
+                max(float(confidence_mean[index]), 0.0)
+            )
             band_energy = float(np.sum(np.square(base_spectra[band_mask, index])))
             normalized_energy = 0.0 if float(total_energy[index]) <= 1e-6 else band_energy / float(total_energy[index])
             grid[cell.row_index, cell.column_index] = np.float32(normalized_energy)
@@ -1442,6 +1643,7 @@ def _build_heatmaps(
         heatmaps[band.band_id] = {
             "grid": grid,
             "band_energy_grid": band_energy_grid,
+            "confidence_grid": confidence_grid,
             "low_confidence_mask": low_confidence_mask,
             "low_confidence_count": int(low_confidence_mask.sum()),
             "reason_summary": reason_summary,
@@ -1479,6 +1681,7 @@ def _build_heatmaps(
     band_energy_scale = max(band_energy_display_max - band_energy_display_min, 1e-12)
     for item in heatmaps.values():
         band_energy_grid = item["band_energy_grid"]
+        confidence_grid = item["confidence_grid"]
         salience_grid = np.zeros_like(band_energy_grid, dtype=np.float32)
         finite_mask = np.isfinite(band_energy_grid)
         if np.any(finite_mask):
@@ -1489,8 +1692,21 @@ def _build_heatmaps(
                 1.0,
             )
             # Keep the normalized heatmap values as the primary data, but fade
-            # very weak band activity so it does not overpower genuinely stronger cells.
-            salience_grid[finite_mask] = np.sqrt(normalized_band_energy).astype(
+            # cells that are only marginally trustworthy so the display stays
+            # focused on coherent motion instead of lighting or texture noise.
+            confidence_visibility = np.sqrt(
+                np.clip(confidence_grid[finite_mask], 0.0, 1.0)
+            ).astype(
+                np.float32,
+                copy=False,
+            )
+            salience_grid[finite_mask] = (
+                np.sqrt(normalized_band_energy).astype(
+                    np.float32,
+                    copy=False,
+                )
+                * confidence_visibility
+            ).astype(
                 np.float32,
                 copy=False,
             )
@@ -1761,6 +1977,14 @@ def _render_heatmap_figure(
         target_height=display_height,
         target_width=display_width,
     )
+    # Portrait clips often arrive pillarboxed inside the working frame. Keep
+    # the overlay inside the visible picture area so hot cells near the edge do
+    # not smear into black bars after interpolation.
+    overlay_alpha *= _build_visible_content_mask(
+        representative_still_frame_rgb,
+        target_height=display_height,
+        target_width=display_width,
+    )
     composite = (
         (grayscale_underlay.astype(np.float32) / np.float32(255.0))
         * (np.float32(1.0) - overlay_alpha[:, :, None])
@@ -1914,6 +2138,88 @@ def _build_grayscale_underlay(
     )
     gray = np.clip(np.round(resized * 255.0), 0, 255).astype(np.uint8)
     return np.repeat(gray[:, :, None], 3, axis=2)
+
+
+def _build_visible_content_mask(
+    frame_rgb: np.ndarray,
+    *,
+    target_height: int,
+    target_width: int,
+) -> np.ndarray:
+    """Build a hard mask for the visibly active picture area so heatmap overlays stay out of encoded black bars."""
+
+    top, bottom, left, right = _visible_content_bounds(frame_rgb)
+    mask = np.zeros((target_height, target_width), dtype=np.float32)
+    source_height, source_width = frame_rgb.shape[:2]
+    top_target = max(0, min(target_height, int(np.floor(top * target_height / max(source_height, 1)))))
+    bottom_target = max(
+        top_target + 1,
+        min(target_height, int(np.ceil(bottom * target_height / max(source_height, 1)))),
+    )
+    left_target = max(0, min(target_width, int(np.floor(left * target_width / max(source_width, 1)))))
+    right_target = max(
+        left_target + 1,
+        min(target_width, int(np.ceil(right * target_width / max(source_width, 1)))),
+    )
+    mask[top_target:bottom_target, left_target:right_target] = np.float32(1.0)
+    return mask
+
+
+def _visible_content_bounds(frame_rgb: np.ndarray) -> tuple[int, int, int, int]:
+    """Detect obvious pillarbox or letterbox bars from the representative still frame so overlay alpha only covers the visible picture area."""
+
+    if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
+        raise ValueError("frame_rgb must have shape [height, width, 3].")
+    luma = (
+        np.float32(0.2126) * frame_rgb[:, :, 0]
+        + np.float32(0.7152) * frame_rgb[:, :, 1]
+        + np.float32(0.0722) * frame_rgb[:, :, 2]
+    ).astype(np.float32, copy=False)
+    height, width = luma.shape
+    column_profile = np.maximum(
+        np.percentile(luma, 99.0, axis=0),
+        luma.std(axis=0) * np.float32(3.0),
+    ).astype(np.float32, copy=False)
+    row_profile = np.maximum(
+        np.percentile(luma, 99.0, axis=1),
+        luma.std(axis=1) * np.float32(3.0),
+    ).astype(np.float32, copy=False)
+    left, right = _edge_profile_active_bounds(column_profile)
+    top, bottom = _edge_profile_active_bounds(row_profile)
+    if right - left < max(8, width // 5):
+        left, right = 0, width
+    if bottom - top < max(8, height // 5):
+        top, bottom = 0, height
+    return top, bottom, left, right
+
+
+def _edge_profile_active_bounds(profile: np.ndarray) -> tuple[int, int]:
+    """Find the active span in one edge profile using a small moving average so isolated dark edge columns do not get mistaken for bars."""
+
+    length = int(profile.shape[0])
+    if length <= 0:
+        return 0, 0
+    threshold = max(
+        0.01,
+        float(np.percentile(profile, 90.0)) * 0.08,
+    )
+    window = max(2, min(12, length // 40))
+
+    start = 0
+    while start + window <= length:
+        if float(np.mean(profile[start : start + window])) >= threshold:
+            break
+        start += 1
+
+    stop = length
+    while stop - window >= 0:
+        if float(np.mean(profile[stop - window : stop])) >= threshold:
+            break
+        stop -= 1
+
+    if stop <= start:
+        return 0, length
+    return start, stop
 
 
 def _build_heatmap_overlay_grid(

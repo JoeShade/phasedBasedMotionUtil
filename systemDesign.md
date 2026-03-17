@@ -399,6 +399,10 @@ The worker scheduler chooses execution parameters automatically based on:
 It determines:
 - native-library thread limits
 - chunk size
+- chunk-size cap and chunking bias
+- worker-internal queue depth
+- numeric helper counts for compute, warp, and optional motion-grid estimation
+- quantitative-analysis collection mode and queue depth
 - memory safety margin
 - staging plan for intermediate data
 
@@ -421,7 +425,9 @@ V1 concurrency is intentionally conservative:
 - one dedicated control/heartbeat thread inside the worker
 - one decode-reader thread inside the worker for the active processing pass
 - one compute thread inside the worker that owns chunk order, phase-filter state, and deterministic numeric work
+- one bounded helper-thread pool that the compute thread may reuse for deterministic row-band or frame-slice work inside a chunk
 - one encode-writer thread inside the worker for the active processing pass
+- zero or one bounded background analysis thread for quantitative-analysis chunk collection
 - bounded worker-internal queues between those stage threads; v1 keeps them intentionally small and records the applied depth
 - no nested Python multiprocessing inside the render worker
 - ffmpeg subprocesses for decode and encode as needed
@@ -451,11 +457,20 @@ The render pipeline uses several performance optimizations to reduce overhead wh
 - No full-clip in-memory reconstruction
 - Bounded chunk size ensures predictable memory use
 
-**Future Enhancements**: Current implementation prioritizes determinism and simplicity. Future improvements may include:
-- Pipelined decode/process/encode with bounded queues for overlapping I/O and CPU
+**Bounded Stage Pipeline**: The worker may overlap decode, compute, and encode with bounded internal queues. Queue depth is a scheduler decision and is recorded in diagnostics.
+
+**Cached Warp Geometry**: Fixed interpolation plans and output-domain sampling lattices are cached inside the phase engine so the warp hot loop only computes per-frame displacement math.
+
+**Bounded Numeric Helper Fan-Out**: The compute coordinator may reuse a bounded helper-thread pool for row-band motion-grid estimation and frame-slice warp work. Temporal filter ownership stays on the coordinator thread, and helper partitions remain contiguous and deterministic.
+
+Current runtime note: the shipped scheduler presets currently keep motion-grid estimation at one worker pending additional real-clip validation, while still using helper fan-out for the warp stage.
+
+**Background Analysis Handoff**: Quantitative-analysis chunk collection may run on one bounded background thread so artifact generation no longer blocks the main compute path chunk-by-chunk.
+
+**Future Enhancements**: Current implementation still favors determinism and bounded memory over speculative fan-out. Possible future work includes:
 - Per-chunk adaptive sizing based on actual utilization
-- Thread-pool based processing for numeric heavy stages
-- Analysis postprocessing in parallel with output finalization
+- Further motion-estimation partition tuning for very large clips
+- Additional observability for native-library CPU saturation
 
 ## 11. Global vs Job Settings
 
@@ -1560,6 +1575,12 @@ The sidecar `results.analysis` payload records:
 
 The current implementation uses a dedicated dense motion-analysis grid inside the worker. That grid reuses the same local motion-estimation backend as the render engine, but it is kept separate from the amplification warp grid so the quantitative-analysis export contract can evolve without changing the encoded video path.
 
+When analysis is enabled, chunk collection may be handed to one bounded background thread inside the worker. Rules:
+- chunk copies must enter that helper through a bounded queue
+- accepted chunks must be analyzed in original chunk order
+- final analysis export must wait for the queue to drain before sidecar/artifact write
+- background-analysis failure downgrades analysis through the existing warning path; it does not silently disappear
+
 UI contract:
 
 - A dedicated **Analysis** section exposes the enable toggle, ROI summary, ROI editor, and band mode selector
@@ -1674,8 +1695,11 @@ Rules:
 - decode/input reading, numeric processing, and encode/input writing may overlap inside the worker
 - chunk order must remain strictly sequential and deterministic end-to-end
 - the compute stage is the only stage allowed to own the streaming phase-filter state
+- the compute stage may reuse a bounded helper-thread pool for deterministic row-band motion estimation and deterministic frame-slice warp work
+- helper partitions must be fixed contiguous ranges rather than unbounded work stealing
 - internal hand-off queues must be bounded and must act as the backpressure boundary
 - v1 keeps these queues intentionally small rather than trying to maximize speculative prefetch
+- quantitative-analysis collection may use one bounded background thread and queue, but final export must still wait for queue drain
 - the applied queue depth and worker-internal stage-thread counts must be recorded in diagnostics
 - this worker-internal pipeline does not relax the single-active-render rule and does not authorize nested render-worker fan-out
 
@@ -1790,6 +1814,8 @@ Every run must record the concurrency settings actually applied, including:
 - OpenCV thread limit if used
 - BLAS/OpenMP-related environment limits
 - worker-internal stage-thread counts
+- compute-helper, warp-helper, and motion-helper counts actually applied
+- quantitative-analysis execution mode and queue depth
 - worker-internal queue depth
 - any stricter runtime clamp chosen by the scheduler
 

@@ -15,6 +15,13 @@ class PreflightSeverity(str, Enum):
     BLOCKER = "blocker"
 
 
+class AnalyzerExecutionMode(str, Enum):
+    """This enum makes the analysis collection handoff explicit so policy presets document whether chunks stay inline or move onto a bounded helper thread."""
+
+    INLINE = "inline"
+    BACKGROUND_THREAD = "background_thread"
+
+
 @dataclass(frozen=True)
 class PreflightIssue:
     """This model carries one human-readable pre-flight finding."""
@@ -66,12 +73,20 @@ class ResourceBudget:
 
 @dataclass(frozen=True)
 class SchedulerInputs:
-    """This model carries the worker plan assumptions that drive safety-biased storage and RAM estimates."""
+    """This model carries the real bounded worker execution plan so pre-flight math, diagnostics, and runtime behavior stay aligned."""
 
     chunk_frames: int = 32
+    chunk_cap_frames: int = 32
+    chunk_target_ram_fraction: float = 0.5
     thread_limit: int = 4
     precision_bytes: int = 4
     native_buffer_multiplier: float = 6.0
+    internal_queue_depth: int = 1
+    compute_worker_count: int = 1
+    warp_worker_count: int = 1
+    motion_worker_count: int = 1
+    analyzer_mode: AnalyzerExecutionMode = AnalyzerExecutionMode.INLINE
+    analysis_queue_depth: int = 0
 
 
 @dataclass(frozen=True)
@@ -133,56 +148,103 @@ def choose_scheduler_inputs(
     """Choose a bounded chunk size from the measured machine budget instead of assuming the whole clip fits in RAM."""
 
     import psutil
+
     precision_bytes = 4
-    native_buffer_multiplier = {
-        ResourcePolicy.CONSERVATIVE: 2.0,
-        ResourcePolicy.BALANCED: 2.5,
-        ResourcePolicy.AGGRESSIVE: 3.0,
-    }[intent.resource_policy]
     admissible_ram_bytes = max(
         budgets.available_ram_bytes - budgets.reserved_ui_headroom_bytes,
         64 * 1024 * 1024,
     )
-    target_fraction = {
-        ResourcePolicy.CONSERVATIVE: 0.35,
-        ResourcePolicy.BALANCED: 0.5,
-        ResourcePolicy.AGGRESSIVE: 0.65,
-    }[intent.resource_policy]
     cpu_count = psutil.cpu_count(logical=True) or 4
+    available_parallel_cores = max(cpu_count - 1, 1)
+
     if intent.resource_policy == ResourcePolicy.AGGRESSIVE:
-        thread_limit = max(1, cpu_count - 1)
-        chunk_cap = min(256, max(96, int(admissible_ram_bytes // (128 * 1024 * 1024))))
+        compute_worker_count = max(2, min(8, available_parallel_cores))
+        warp_worker_count = compute_worker_count
+        # Motion-grid helper fan-out is intentionally held at one worker for
+        # now. The warp stage delivered most of the safe speedup, while motion
+        # estimation is the newest numeric helper path and should stay
+        # conservative until it has more real-clip validation.
+        motion_worker_count = 1
+        internal_queue_depth = 3
+        analyzer_mode = AnalyzerExecutionMode.BACKGROUND_THREAD
+        analysis_queue_depth = 2
+        chunk_cap_frames = min(
+            256,
+            max(96, int(admissible_ram_bytes // (128 * 1024 * 1024))),
+        )
+        chunk_target_ram_fraction = 0.65
+        native_buffer_multiplier = 3.0
     elif intent.resource_policy == ResourcePolicy.BALANCED:
-        thread_limit = min(4, cpu_count // 2)
-        chunk_cap = 48
+        compute_worker_count = max(2, min(4, max(available_parallel_cores // 2, 1)))
+        warp_worker_count = compute_worker_count
+        motion_worker_count = 1
+        internal_queue_depth = 2
+        analyzer_mode = AnalyzerExecutionMode.BACKGROUND_THREAD
+        analysis_queue_depth = 1
+        chunk_cap_frames = 48
+        chunk_target_ram_fraction = 0.5
+        native_buffer_multiplier = 2.5
     else:
-        thread_limit = 1
-        chunk_cap = 24
+        compute_worker_count = 1
+        warp_worker_count = 1
+        motion_worker_count = 1
+        internal_queue_depth = 1
+        analyzer_mode = AnalyzerExecutionMode.BACKGROUND_THREAD
+        analysis_queue_depth = 1
+        chunk_cap_frames = 24
+        chunk_target_ram_fraction = 0.35
+        native_buffer_multiplier = 2.0
+
+    thread_limit = max(
+        compute_worker_count,
+        warp_worker_count,
+        motion_worker_count,
+    )
     probe_inputs = PreflightInputs(
         intent=intent,
         source=source,
         budgets=budgets,
         scheduler=SchedulerInputs(
             chunk_frames=1,
+            chunk_cap_frames=chunk_cap_frames,
+            chunk_target_ram_fraction=chunk_target_ram_fraction,
             thread_limit=thread_limit,
             precision_bytes=precision_bytes,
             native_buffer_multiplier=native_buffer_multiplier,
+            internal_queue_depth=internal_queue_depth,
+            compute_worker_count=compute_worker_count,
+            warp_worker_count=warp_worker_count,
+            motion_worker_count=motion_worker_count,
+            analyzer_mode=analyzer_mode,
+            analysis_queue_depth=analysis_queue_depth,
         ),
         diagnostic_level=diagnostic_level,
     )
     fixed_overhead_bytes = estimate_streaming_fixed_ram_bytes(probe_inputs)
     per_frame_bytes = estimate_streaming_per_frame_ram_bytes(probe_inputs)
     chunk_budget_bytes = max(
-        int(admissible_ram_bytes * target_fraction) - fixed_overhead_bytes,
+        int(admissible_ram_bytes * chunk_target_ram_fraction) - fixed_overhead_bytes,
         per_frame_bytes,
     )
     chunk_frames = max(1, chunk_budget_bytes // max(per_frame_bytes, 1))
-    chunk_frames = min(chunk_frames, max(source.frame_count, 1), chunk_cap)
+    chunk_frames = min(
+        chunk_frames,
+        max(source.frame_count, 1),
+        chunk_cap_frames,
+    )
     return SchedulerInputs(
         chunk_frames=max(1, int(chunk_frames)),
+        chunk_cap_frames=chunk_cap_frames,
+        chunk_target_ram_fraction=chunk_target_ram_fraction,
         thread_limit=thread_limit,
         precision_bytes=precision_bytes,
         native_buffer_multiplier=native_buffer_multiplier,
+        internal_queue_depth=internal_queue_depth,
+        compute_worker_count=compute_worker_count,
+        warp_worker_count=warp_worker_count,
+        motion_worker_count=motion_worker_count,
+        analyzer_mode=analyzer_mode,
+        analysis_queue_depth=analysis_queue_depth,
     )
 
 

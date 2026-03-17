@@ -6,6 +6,7 @@ import math
 
 import numpy as np
 
+import phase_motion_app.core.phase_engine as phase_engine_module
 from phase_motion_app.core.phase_engine import StreamingPhaseAmplifier, amplify_motion_rgb
 
 
@@ -198,3 +199,140 @@ def test_streaming_phase_amplifier_increases_motion_amplitude_across_chunks() ->
     assert amplified.min() >= 0.0
     assert amplified.max() <= 1.0
     assert amplified_amplitude > source_amplitude * 1.1
+
+
+def test_phase_engine_parallel_helper_partitions_match_serial_output() -> None:
+    clip = _make_blob_motion_clip()
+
+    serial = amplify_motion_rgb(
+        clip,
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=3.0,
+        magnification=4.0,
+        warp_worker_count=1,
+        motion_worker_count=1,
+    )
+    parallel = amplify_motion_rgb(
+        clip,
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=3.0,
+        magnification=4.0,
+        warp_worker_count=3,
+        motion_worker_count=2,
+    )
+
+    assert np.allclose(parallel, serial, atol=1e-5)
+
+
+def test_cached_scalar_field_resize_plan_matches_uncached_resize() -> None:
+    field = np.arange(16, dtype=np.float32).reshape(4, 4)
+    resize_plan = phase_engine_module._build_scalar_field_resize_plan(
+        source_height=4,
+        source_width=4,
+        target_height=9,
+        target_width=7,
+    )
+
+    uncached = phase_engine_module._resize_scalar_field_bilinear(
+        field,
+        target_height=9,
+        target_width=7,
+    )
+    cached = phase_engine_module._resize_scalar_field_bilinear(
+        field,
+        target_height=9,
+        target_width=7,
+        plan=resize_plan,
+    )
+
+    assert uncached.shape == (9, 7)
+    assert np.allclose(cached, uncached, atol=1e-6)
+
+
+def test_streaming_phase_amplifier_parallel_workers_preserve_chunk_order() -> None:
+    clip = _make_blob_motion_clip()
+    reference_luma = (
+        0.2126 * clip[..., 0] + 0.7152 * clip[..., 1] + 0.0722 * clip[..., 2]
+    ).mean(axis=0).astype(np.float32)
+    serial = StreamingPhaseAmplifier(
+        reference_luma=reference_luma,
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=3.0,
+        magnification=4.0,
+        warp_worker_count=1,
+        motion_worker_count=1,
+    )
+    parallel = StreamingPhaseAmplifier(
+        reference_luma=reference_luma,
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=3.0,
+        magnification=4.0,
+        warp_worker_count=3,
+        motion_worker_count=2,
+    )
+
+    try:
+        serial_output = np.concatenate(
+            (
+                serial.process_chunk(clip[:7]),
+                serial.process_chunk(clip[7:15]),
+                serial.process_chunk(clip[15:]),
+            ),
+            axis=0,
+        )
+        parallel_output = np.concatenate(
+            (
+                parallel.process_chunk(clip[:7]),
+                parallel.process_chunk(clip[7:15]),
+                parallel.process_chunk(clip[15:]),
+            ),
+            axis=0,
+        )
+    finally:
+        serial.close()
+        parallel.close()
+
+    assert np.allclose(parallel_output, serial_output, atol=1e-5)
+
+
+def test_confidence_normalization_suppresses_weak_cells_without_reordering_strength() -> None:
+    confidence = np.array(
+        [
+            [0.0, 0.05, 0.2],
+            [0.5, 0.8, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    normalized = phase_engine_module._normalize_confidence(confidence)
+
+    assert normalized.shape == confidence.shape
+    assert normalized.dtype == np.float32
+    assert float(normalized[0, 0]) == 0.0
+    assert float(normalized[0, 1]) < 0.1
+    assert float(normalized[0, 2]) < float(normalized[1, 0]) < float(normalized[1, 1])
+    assert float(normalized[1, 2]) == 1.0
+
+
+def test_analysis_confidence_normalization_preserves_mid_confidence_cells_more_than_render_gate() -> None:
+    confidence = np.array(
+        [
+            [0.0, 0.05, 0.2],
+            [0.5, 0.8, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    render_normalized = phase_engine_module._normalize_confidence(confidence)
+    analysis_normalized = phase_engine_module._normalize_analysis_confidence(confidence)
+
+    assert analysis_normalized.shape == confidence.shape
+    assert analysis_normalized.dtype == np.float32
+    assert float(analysis_normalized[0, 0]) == 0.0
+    assert float(analysis_normalized[0, 1]) > float(render_normalized[0, 1])
+    assert float(analysis_normalized[0, 2]) > float(render_normalized[0, 2])
+    assert float(analysis_normalized[1, 2]) == 1.0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Executor, ThreadPoolExecutor
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -35,6 +36,33 @@ class _MotionReference:
     layout: _MotionGridLayout
     window: np.ndarray
     tiles: tuple[tuple[_MotionReferenceTile, ...], ...]
+
+
+@dataclass(frozen=True)
+class _ScalarFieldResizePlan:
+    """This model caches one scalar-field resize geometry so hot-loop bilinear upsampling stops rebuilding the same interpolation vectors every frame."""
+
+    source_height: int
+    source_width: int
+    target_height: int
+    target_width: int
+    x0: np.ndarray
+    x1: np.ndarray
+    wx: np.ndarray
+    y0: np.ndarray
+    y1: np.ndarray
+    wy: np.ndarray
+
+
+@dataclass(frozen=True)
+class _WarpGeometry:
+    """This model keeps reusable output-domain warp geometry explicit so each chunk only recomputes the per-frame displacement field, not the fixed sampling lattice."""
+
+    height: int
+    width: int
+    resize_plan: _ScalarFieldResizePlan
+    base_x: np.ndarray
+    base_y: np.ndarray
 
 
 class _StreamingBandpassFilter:
@@ -87,6 +115,9 @@ class StreamingPhaseAmplifier:
         magnification: float,
         sigma: float = 1.0,
         attenuate_other_frequencies: bool = True,
+        warp_worker_count: int = 1,
+        motion_worker_count: int = 1,
+        worker_pool: Executor | None = None,
     ) -> None:
         if reference_luma.ndim != 2:
             raise ValueError("reference_luma must have shape [height, width].")
@@ -115,6 +146,41 @@ class StreamingPhaseAmplifier:
         )
         self._magnification = np.float32(magnification)
         self._attenuate_other_frequencies = attenuate_other_frequencies
+        self._warp_worker_count = max(1, int(warp_worker_count))
+        self._motion_worker_count = max(1, int(motion_worker_count))
+        self._owned_worker_pool: ThreadPoolExecutor | None = None
+        self._worker_pool = worker_pool
+        helper_count = max(self._warp_worker_count, self._motion_worker_count)
+        if self._worker_pool is None and helper_count > 1:
+            # The helper pool lives for the whole render so chunks reuse the same
+            # threads instead of paying create/destroy overhead every batch.
+            self._owned_worker_pool = ThreadPoolExecutor(
+                max_workers=helper_count,
+                thread_name_prefix="phase-engine",
+            )
+            self._worker_pool = self._owned_worker_pool
+        self._warp_geometry = _build_warp_geometry(
+            height=self._reference.height,
+            width=self._reference.width,
+            source_height=len(self._reference.layout.row_starts),
+            source_width=len(self._reference.layout.column_starts),
+        )
+
+    def close(self) -> None:
+        """Release any helper pool the amplifier created itself so direct unit tests do not leak worker threads."""
+
+        if self._owned_worker_pool is None:
+            return
+        self._owned_worker_pool.shutdown(wait=True, cancel_futures=True)
+        self._owned_worker_pool = None
+        self._worker_pool = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Destructor cleanup is best-effort only.
+            pass
 
     def process_chunk(
         self,
@@ -140,6 +206,8 @@ class StreamingPhaseAmplifier:
         displacement_x, displacement_y, confidence = _estimate_local_phase_shifts_against_reference(
             luma,
             self._reference,
+            worker_pool=self._worker_pool,
+            worker_count=self._motion_worker_count,
             progress_callback=progress_callback,
         )
         if progress_callback is not None:
@@ -184,7 +252,10 @@ class StreamingPhaseAmplifier:
             displacement_x_grid=displacement_x_grid,
             displacement_y_grid=displacement_y_grid,
             layout=self._reference.layout,
+            geometry=self._warp_geometry,
             max_displacement_px=max_displacement_px,
+            worker_pool=self._worker_pool,
+            worker_count=self._warp_worker_count,
             progress_callback=progress_callback,
             progress_prefix="warp",
         )
@@ -202,6 +273,8 @@ def amplify_motion_rgb(
     magnification: float,
     sigma: float = 1.0,
     attenuate_other_frequencies: bool = True,
+    warp_worker_count: int = 1,
+    motion_worker_count: int = 1,
     progress_callback: Callable[[str], None] | None = None,
 ) -> np.ndarray:
     """Amplify motion by phase-correlating local windows, filtering those motions over time, and warping the original RGB clip with the amplified displacement field."""
@@ -219,69 +292,91 @@ def amplify_motion_rgb(
         width=luma.shape[2],
         sigma_scale=max(sigma, 0.1),
     )
-    displacement_x, displacement_y, confidence = _estimate_local_phase_shifts(
-        luma,
-        layout,
-        progress_callback=progress_callback,
-    )
-    if progress_callback is not None:
-        progress_callback("motion_grid_done")
-
-    bandpassed_x = _temporal_bandpass(
-        displacement_x,
-        fps=fps,
-        low_hz=low_hz,
-        high_hz=high_hz,
-        progress_callback=progress_callback,
-        progress_prefix="x_temporal_band",
-    )
-    if progress_callback is not None:
-        progress_callback("x_temporal_band_done")
-
-    bandpassed_y = _temporal_bandpass(
-        displacement_y,
-        fps=fps,
-        low_hz=low_hz,
-        high_hz=high_hz,
-        progress_callback=progress_callback,
-        progress_prefix="y_temporal_band",
-    )
-    if progress_callback is not None:
-        progress_callback("y_temporal_band_done")
-
-    if attenuate_other_frequencies:
-        phase_motion_x = bandpassed_x
-        phase_motion_y = bandpassed_y
-    else:
-        phase_motion_x = bandpassed_x + np.float32(0.25) * (
-            displacement_x - displacement_x.mean(axis=0, dtype=np.float32)
+    worker_pool: ThreadPoolExecutor | None = None
+    helper_count = max(int(warp_worker_count), int(motion_worker_count), 1)
+    if helper_count > 1:
+        worker_pool = ThreadPoolExecutor(
+            max_workers=helper_count,
+            thread_name_prefix="phase-engine",
         )
-        phase_motion_y = bandpassed_y + np.float32(0.25) * (
-            displacement_y - displacement_y.mean(axis=0, dtype=np.float32)
+    try:
+        displacement_x, displacement_y, confidence = _estimate_local_phase_shifts(
+            luma,
+            layout,
+            worker_pool=worker_pool,
+            worker_count=motion_worker_count,
+            progress_callback=progress_callback,
         )
+        if progress_callback is not None:
+            progress_callback("motion_grid_done")
 
-    confidence_scale = _normalize_confidence(confidence)
-    # Local phase-correlation shifts undershoot subtle subpixel motion unless the
-    # amplified field gets a small extra lift before resampling.
-    motion_gain = np.float32(magnification * 1.4)
-    displacement_x_grid = phase_motion_x * confidence_scale[None, :, :] * motion_gain
-    displacement_y_grid = phase_motion_y * confidence_scale[None, :, :] * motion_gain
+        bandpassed_x = _temporal_bandpass(
+            displacement_x,
+            fps=fps,
+            low_hz=low_hz,
+            high_hz=high_hz,
+            progress_callback=progress_callback,
+            progress_prefix="x_temporal_band",
+        )
+        if progress_callback is not None:
+            progress_callback("x_temporal_band_done")
 
-    max_displacement_px = np.float32(
-        max(1.0, min(min(luma.shape[1], luma.shape[2]) / 24.0, 6.0))
-    )
-    amplified_rgb = _warp_rgb_frames(
-        working,
-        displacement_x_grid=displacement_x_grid,
-        displacement_y_grid=displacement_y_grid,
-        layout=layout,
-        max_displacement_px=max_displacement_px,
-        progress_callback=progress_callback,
-        progress_prefix="warp",
-    )
-    if progress_callback is not None:
-        progress_callback("warp_done")
-    return np.clip(amplified_rgb, 0.0, 1.0).astype(np.float32, copy=False)
+        bandpassed_y = _temporal_bandpass(
+            displacement_y,
+            fps=fps,
+            low_hz=low_hz,
+            high_hz=high_hz,
+            progress_callback=progress_callback,
+            progress_prefix="y_temporal_band",
+        )
+        if progress_callback is not None:
+            progress_callback("y_temporal_band_done")
+
+        if attenuate_other_frequencies:
+            phase_motion_x = bandpassed_x
+            phase_motion_y = bandpassed_y
+        else:
+            phase_motion_x = bandpassed_x + np.float32(0.25) * (
+                displacement_x - displacement_x.mean(axis=0, dtype=np.float32)
+            )
+            phase_motion_y = bandpassed_y + np.float32(0.25) * (
+                displacement_y - displacement_y.mean(axis=0, dtype=np.float32)
+            )
+
+        confidence_scale = _normalize_confidence(confidence)
+        # Local phase-correlation shifts undershoot subtle subpixel motion unless the
+        # amplified field gets a small extra lift before resampling.
+        motion_gain = np.float32(magnification * 1.4)
+        displacement_x_grid = phase_motion_x * confidence_scale[None, :, :] * motion_gain
+        displacement_y_grid = phase_motion_y * confidence_scale[None, :, :] * motion_gain
+
+        max_displacement_px = np.float32(
+            max(1.0, min(min(luma.shape[1], luma.shape[2]) / 24.0, 6.0))
+        )
+        amplified_rgb = _warp_rgb_frames(
+            working,
+            displacement_x_grid=displacement_x_grid,
+            displacement_y_grid=displacement_y_grid,
+            layout=layout,
+            geometry=_build_warp_geometry(
+                height=luma.shape[1],
+                width=luma.shape[2],
+                source_height=len(layout.row_starts),
+                source_width=len(layout.column_starts),
+            ),
+            max_displacement_px=max_displacement_px,
+            worker_pool=worker_pool,
+            worker_count=warp_worker_count,
+            progress_callback=progress_callback,
+            progress_prefix="warp",
+        )
+        if progress_callback is not None:
+            progress_callback("warp_done")
+        return np.clip(amplified_rgb, 0.0, 1.0).astype(np.float32, copy=False)
+    finally:
+        if worker_pool is not None:
+            worker_pool.shutdown(wait=True, cancel_futures=True)
+    
 
 
 def _build_motion_grid_layout(
@@ -317,6 +412,8 @@ def _estimate_local_phase_shifts(
     luma: np.ndarray,
     layout: _MotionGridLayout,
     *,
+    worker_pool: Executor | None = None,
+    worker_count: int = 1,
     progress_callback: Callable[[str], None] | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     reference_frame = luma.mean(axis=0, dtype=np.float32).astype(np.float32, copy=False)
@@ -324,6 +421,8 @@ def _estimate_local_phase_shifts(
     return _estimate_local_phase_shifts_against_reference(
         luma,
         reference,
+        worker_pool=worker_pool,
+        worker_count=worker_count,
         progress_callback=progress_callback,
     )
 
@@ -384,6 +483,8 @@ def _estimate_local_phase_shifts_against_reference(
     luma: np.ndarray,
     reference: _MotionReference,
     *,
+    worker_pool: Executor | None = None,
+    worker_count: int = 1,
     progress_callback: Callable[[str], None] | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     frame_count = luma.shape[0]
@@ -392,20 +493,71 @@ def _estimate_local_phase_shifts_against_reference(
     displacement_x = np.zeros((frame_count, row_count, column_count), dtype=np.float32)
     displacement_y = np.zeros_like(displacement_x)
     confidence = np.zeros((row_count, column_count), dtype=np.float32)
-    tile_count = max(1, row_count * column_count)
-    processed_tiles = 0
+    worker_count = max(1, min(int(worker_count), row_count))
+    if worker_pool is None or worker_count == 1 or row_count <= 1:
+        tile_count = max(1, row_count * column_count)
+        processed_tiles = 0
+        for row_index in range(row_count):
+            processed_tiles += _estimate_local_phase_row_band(
+                luma,
+                reference,
+                row_start_index=row_index,
+                row_stop_index=row_index + 1,
+                displacement_x=displacement_x,
+                displacement_y=displacement_y,
+                confidence=confidence,
+            )
+            if progress_callback is not None:
+                progress_callback(f"motion_grid_tile_{processed_tiles}_of_{tile_count}")
+        return displacement_x, displacement_y, confidence
 
-    for row_index, row_start in enumerate(reference.layout.row_starts):
+    row_ranges = _partition_axis(row_count, worker_count)
+    futures = [
+        worker_pool.submit(
+            _estimate_local_phase_row_band,
+            luma,
+            reference,
+            row_start_index,
+            row_stop_index,
+            displacement_x,
+            displacement_y,
+            confidence,
+        )
+        for row_start_index, row_stop_index in row_ranges
+    ]
+    for partition_index, future in enumerate(futures, start=1):
+        future.result()
+        if progress_callback is not None:
+            progress_callback(
+                f"motion_grid_partition_{partition_index}_of_{len(futures)}"
+            )
+
+    return displacement_x, displacement_y, confidence
+
+
+def _estimate_local_phase_row_band(
+    luma: np.ndarray,
+    reference: _MotionReference,
+    row_start_index: int,
+    row_stop_index: int,
+    displacement_x: np.ndarray,
+    displacement_y: np.ndarray,
+    confidence: np.ndarray,
+) -> int:
+    """Process one deterministic row band of the motion grid so helper threads never compete for the same output slice."""
+
+    processed_tiles = 0
+    for row_index in range(row_start_index, row_stop_index):
+        row_start = reference.layout.row_starts[row_index]
         row_end = row_start + reference.layout.tile_size
         for column_index, column_start in enumerate(reference.layout.column_starts):
             column_end = column_start + reference.layout.tile_size
             reference_tile = reference.tiles[row_index][column_index]
-            if reference_tile.reference_fft is None or reference_tile.texture_strength < 1e-4:
+            if (
+                reference_tile.reference_fft is None
+                or reference_tile.texture_strength < 1e-4
+            ):
                 processed_tiles += 1
-                if progress_callback is not None:
-                    progress_callback(
-                        f"motion_grid_tile_{processed_tiles}_of_{tile_count}"
-                    )
                 continue
 
             tile_stack = (
@@ -433,12 +585,25 @@ def _estimate_local_phase_shifts_against_reference(
             confidence[row_index, column_index] = np.float32(
                 reference_tile.texture_strength * peak_quality
             )
-
             processed_tiles += 1
-            if progress_callback is not None:
-                progress_callback(f"motion_grid_tile_{processed_tiles}_of_{tile_count}")
+    return processed_tiles
 
-    return displacement_x, displacement_y, confidence
+
+def _partition_axis(length: int, partition_count: int) -> list[tuple[int, int]]:
+    """Split work into fixed contiguous ranges so helper fan-out stays deterministic and bounded."""
+
+    bounded_partition_count = max(1, min(length, partition_count))
+    base = length // bounded_partition_count
+    remainder = length % bounded_partition_count
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for partition_index in range(bounded_partition_count):
+        width = base + (1 if partition_index < remainder else 0)
+        if width <= 0:
+            continue
+        ranges.append((cursor, cursor + width))
+        cursor += width
+    return ranges
 
 
 def _rgb_to_luma(frames_rgb: np.ndarray) -> np.ndarray:
@@ -512,12 +677,79 @@ def _hann_window(size: int) -> np.ndarray:
     return np.outer(base, base).astype(np.float32, copy=False)
 
 
-def _normalize_confidence(confidence: np.ndarray) -> np.ndarray:
-    max_confidence = float(confidence.max())
-    if max_confidence <= 1e-6:
+def _scale_confidence_against_percentile(
+    confidence: np.ndarray,
+    *,
+    reference_percentile: float,
+) -> np.ndarray:
+    """Scale one confidence grid against a robust percentile so outliers do not define the whole transfer curve."""
+
+    positive_confidence = confidence[confidence > np.float32(0.0)]
+    if positive_confidence.size == 0:
         return np.zeros_like(confidence, dtype=np.float32)
-    normalized = np.clip(confidence / np.float32(max_confidence), 0.0, 1.0)
-    return np.sqrt(normalized).astype(np.float32, copy=False)
+    reference_confidence = float(np.percentile(positive_confidence, reference_percentile))
+    if reference_confidence <= 1e-6:
+        reference_confidence = float(positive_confidence.max())
+    if reference_confidence <= 1e-6:
+        return np.zeros_like(confidence, dtype=np.float32)
+    return np.clip(
+        confidence / np.float32(reference_confidence),
+        0.0,
+        1.0,
+    ).astype(np.float32, copy=False)
+
+
+def _apply_confidence_floor(
+    normalized_confidence: np.ndarray,
+    *,
+    confidence_floor: float,
+) -> np.ndarray:
+    """Apply one soft floor so tiny-confidence cells do not survive just because the grid was globally weak."""
+
+    return np.clip(
+        (normalized_confidence - np.float32(confidence_floor))
+        / np.float32(1.0 - confidence_floor),
+        0.0,
+        1.0,
+    )
+
+
+def _normalize_confidence(confidence: np.ndarray) -> np.ndarray:
+    """Return the render-time confidence weight so weak cells are damped without flattening the whole motion field."""
+
+    # The render path needs to suppress unstable tiles more strongly than the
+    # analysis path, but the previous all-smoothstep gate crushed too many
+    # medium-confidence cells and visibly thinned the amplified motion field.
+    normalized = _scale_confidence_against_percentile(
+        confidence,
+        reference_percentile=97.0,
+    )
+    gated = _apply_confidence_floor(normalized, confidence_floor=0.03)
+    smooth = gated * gated * (np.float32(3.0) - np.float32(2.0) * gated)
+    softened = np.sqrt(gated).astype(np.float32, copy=False)
+    return (
+        np.float32(0.5) * softened + np.float32(0.5) * smooth
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _normalize_analysis_confidence(confidence: np.ndarray) -> np.ndarray:
+    """Return the analysis confidence weight so real motion stays visible in ROI scoring and heatmaps."""
+
+    # Analysis quality should not collapse just because the render path uses a
+    # stricter anti-shimmer gate. Keep a light floor and a square-root lift so
+    # mid-confidence cells still contribute coherent heatmap structure.
+    normalized = _scale_confidence_against_percentile(
+        confidence,
+        reference_percentile=98.0,
+    )
+    gated = _apply_confidence_floor(normalized, confidence_floor=0.01)
+    return np.sqrt(gated).astype(
+        np.float32,
+        copy=False,
+    )
 
 
 def _temporal_bandpass(
@@ -567,46 +799,201 @@ def _warp_rgb_frames(
     displacement_x_grid: np.ndarray,
     displacement_y_grid: np.ndarray,
     layout: _MotionGridLayout,
+    geometry: _WarpGeometry | None = None,
     max_displacement_px: np.float32,
+    worker_pool: Executor | None = None,
+    worker_count: int = 1,
     progress_callback: Callable[[str], None] | None,
     progress_prefix: str,
 ) -> np.ndarray:
     frame_count, height, width, _ = frames_rgb.shape
     output = np.empty_like(frames_rgb, dtype=np.float32)
-    base_x = np.broadcast_to(
-        np.arange(width, dtype=np.float32)[None, :],
-        (height, width),
+    if geometry is None:
+        geometry = _build_warp_geometry(
+            height=height,
+            width=width,
+            source_height=len(layout.row_starts),
+            source_width=len(layout.column_starts),
+        )
+    worker_count = max(1, min(int(worker_count), frame_count))
+    if worker_pool is None or worker_count == 1 or frame_count <= 1:
+        _warp_rgb_frame_slice(
+            frames_rgb=frames_rgb,
+            displacement_x_grid=displacement_x_grid,
+            displacement_y_grid=displacement_y_grid,
+            geometry=geometry,
+            max_displacement_px=max_displacement_px,
+            output=output,
+            frame_start=0,
+            frame_stop=frame_count,
+        )
+        if progress_callback is not None:
+            progress_step = max(1, frame_count // 24)
+            for frame_index in range(frame_count):
+                if frame_index == frame_count - 1 or frame_index % progress_step == 0:
+                    progress_callback(
+                        f"{progress_prefix}_frame_{frame_index + 1}_of_{frame_count}"
+                    )
+        return output
+
+    frame_ranges = _partition_axis(frame_count, worker_count)
+    futures = [
+        worker_pool.submit(
+            _warp_rgb_frame_slice,
+            frames_rgb,
+            displacement_x_grid,
+            displacement_y_grid,
+            geometry,
+            max_displacement_px,
+            output,
+            frame_start,
+            frame_stop,
+        )
+        for frame_start, frame_stop in frame_ranges
+    ]
+    for partition_index, future in enumerate(futures, start=1):
+        future.result()
+        if progress_callback is not None:
+            completed_frames = frame_ranges[partition_index - 1][1]
+            progress_callback(
+                f"{progress_prefix}_frame_{completed_frames}_of_{frame_count}"
+            )
+    return output
+
+
+def _resize_scalar_field_bilinear(
+    field: np.ndarray,
+    *,
+    target_height: int,
+    target_width: int,
+    plan: _ScalarFieldResizePlan | None = None,
+) -> np.ndarray:
+    resize_plan = plan
+    if resize_plan is None:
+        resize_plan = _build_scalar_field_resize_plan(
+            source_height=field.shape[0],
+            source_width=field.shape[1],
+            target_height=target_height,
+            target_width=target_width,
+        )
+    return _resize_scalar_field_with_plan(field, resize_plan)
+
+
+def _build_warp_geometry(
+    *,
+    height: int,
+    width: int,
+    source_height: int,
+    source_width: int,
+) -> _WarpGeometry:
+    """Build the fixed warp sampling lattice once per geometry so the hot loop only does per-frame math."""
+
+    return _WarpGeometry(
+        height=height,
+        width=width,
+        resize_plan=_build_scalar_field_resize_plan(
+            source_height=source_height,
+            source_width=source_width,
+            target_height=height,
+            target_width=width,
+        ),
+        base_x=np.broadcast_to(
+            np.arange(width, dtype=np.float32)[None, :],
+            (height, width),
+        ),
+        base_y=np.broadcast_to(
+            np.arange(height, dtype=np.float32)[:, None],
+            (height, width),
+        ),
     )
-    base_y = np.broadcast_to(
-        np.arange(height, dtype=np.float32)[:, None],
-        (height, width),
+
+
+def _build_scalar_field_resize_plan(
+    *,
+    source_height: int,
+    source_width: int,
+    target_height: int,
+    target_width: int,
+) -> _ScalarFieldResizePlan:
+    """Precompute bilinear interpolation coordinates once because the motion grid geometry stays fixed for the whole render."""
+
+    x = np.linspace(0.0, source_width - 1, target_width, dtype=np.float32)
+    y = np.linspace(0.0, source_height - 1, target_height, dtype=np.float32)
+    x0 = np.floor(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    x1 = np.clip(x0 + 1, 0, source_width - 1)
+    y1 = np.clip(y0 + 1, 0, source_height - 1)
+    return _ScalarFieldResizePlan(
+        source_height=source_height,
+        source_width=source_width,
+        target_height=target_height,
+        target_width=target_width,
+        x0=x0,
+        x1=x1,
+        wx=(x - x0).astype(np.float32),
+        y0=y0,
+        y1=y1,
+        wy=(y - y0).astype(np.float32),
     )
-    progress_step = max(1, frame_count // 24)
-    for frame_index in range(frame_count):
+
+
+def _resize_scalar_field_with_plan(
+    field: np.ndarray,
+    plan: _ScalarFieldResizePlan,
+) -> np.ndarray:
+    """Apply one cached resize plan so each frame only does the interpolation math, not the geometry setup."""
+
+    if field.shape != (plan.source_height, plan.source_width):
+        raise ValueError("field shape does not match the cached resize plan.")
+    if (
+        plan.source_height == plan.target_height
+        and plan.source_width == plan.target_width
+    ):
+        return field.astype(np.float32, copy=False)
+
+    rows0 = field[plan.y0, :]
+    rows1 = field[plan.y1, :]
+    interp_y = rows0 * (1.0 - plan.wy)[:, None] + rows1 * plan.wy[:, None]
+    cols0 = interp_y[:, plan.x0]
+    cols1 = interp_y[:, plan.x1]
+    return cols0 * (1.0 - plan.wx)[None, :] + cols1 * plan.wx[None, :]
+
+
+def _warp_rgb_frame_slice(
+    frames_rgb: np.ndarray,
+    displacement_x_grid: np.ndarray,
+    displacement_y_grid: np.ndarray,
+    geometry: _WarpGeometry,
+    max_displacement_px: np.float32,
+    output: np.ndarray,
+    frame_start: int,
+    frame_stop: int,
+) -> None:
+    """Warp one contiguous frame slice so helpers never fight over output ordering or shared write targets."""
+
+    for frame_index in range(frame_start, frame_stop):
         full_x = np.clip(
-            _resize_scalar_field_bilinear(
+            _resize_scalar_field_with_plan(
                 displacement_x_grid[frame_index],
-                target_height=height,
-                target_width=width,
+                geometry.resize_plan,
             ),
             -max_displacement_px,
             max_displacement_px,
         )
         full_y = np.clip(
-            _resize_scalar_field_bilinear(
+            _resize_scalar_field_with_plan(
                 displacement_y_grid[frame_index],
-                target_height=height,
-                target_width=width,
+                geometry.resize_plan,
             ),
             -max_displacement_px,
             max_displacement_px,
         )
-        sample_x = np.clip(base_x + full_x, 0.0, width - 1.001)
-        sample_y = np.clip(base_y + full_y, 0.0, height - 1.001)
+        sample_x = np.clip(geometry.base_x + full_x, 0.0, geometry.width - 1.001)
+        sample_y = np.clip(geometry.base_y + full_y, 0.0, geometry.height - 1.001)
         x0 = np.floor(sample_x).astype(np.int32)
         y0 = np.floor(sample_y).astype(np.int32)
-        x1 = np.clip(x0 + 1, 0, width - 1)
-        y1 = np.clip(y0 + 1, 0, height - 1)
+        x1 = np.clip(x0 + 1, 0, geometry.width - 1)
+        y1 = np.clip(y0 + 1, 0, geometry.height - 1)
         wx = (sample_x - x0).astype(np.float32)
         wy = (sample_y - y0).astype(np.float32)
 
@@ -619,36 +1006,6 @@ def _warp_rgb_frames(
         top = top_left * (1.0 - wx)[..., None] + top_right * wx[..., None]
         bottom = bottom_left * (1.0 - wx)[..., None] + bottom_right * wx[..., None]
         output[frame_index] = top * (1.0 - wy)[..., None] + bottom * wy[..., None]
-
-        if progress_callback is not None and (
-            frame_index == frame_count - 1 or frame_index % progress_step == 0
-        ):
-            progress_callback(f"{progress_prefix}_frame_{frame_index + 1}_of_{frame_count}")
-    return output
-
-
-def _resize_scalar_field_bilinear(
-    field: np.ndarray, *, target_height: int, target_width: int
-) -> np.ndarray:
-    source_height, source_width = field.shape
-    if source_height == target_height and source_width == target_width:
-        return field.astype(np.float32, copy=False)
-
-    x = np.linspace(0.0, source_width - 1, target_width)
-    y = np.linspace(0.0, source_height - 1, target_height)
-    x0 = np.floor(x).astype(np.int32)
-    y0 = np.floor(y).astype(np.int32)
-    x1 = np.clip(x0 + 1, 0, source_width - 1)
-    y1 = np.clip(y0 + 1, 0, source_height - 1)
-    wx = (x - x0).astype(np.float32)
-    wy = (y - y0).astype(np.float32)
-
-    rows0 = field[y0, :]
-    rows1 = field[y1, :]
-    interp_y = rows0 * (1.0 - wy)[:, None] + rows1 * wy[:, None]
-    cols0 = interp_y[:, x0]
-    cols1 = interp_y[:, x1]
-    return cols0 * (1.0 - wx)[None, :] + cols1 * wx[None, :]
 
 
 def _choose_row_band_height(frame_count: int, height: int, width: int) -> int:
