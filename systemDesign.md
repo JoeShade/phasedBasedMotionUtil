@@ -406,11 +406,13 @@ It determines:
 
 `Aggressive` must still preserve shell responsiveness.
 
-Rules:
-- never schedule more than a coarse v1 heuristic cap derived from machine topology; `N-1 logical cores` is the default ceiling, not a guarantee
-- reserve mandatory UI headroom
-- reserve memory margin
-- prefer completion stability over theoretical maximum throughput
+ Rules:
+ - Dynamically schedule up to `N-1` logical cores for aggressive policy, based on available CPU cores at runtime
+ - Dynamically increase chunk size for aggressive policy if RAM allows, up to a safe maximum (e.g., 256 frames)
+ - Reserve mandatory UI headroom
+ - Reserve memory margin
+ - Prefer completion stability over theoretical maximum throughput
+ - Monitor actual CPU and RAM usage during render and adjust chunk size or thread limit if underutilized (future enhancement)
 
 ### 10.4 Authoritative Concurrency Model
 

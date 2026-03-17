@@ -132,7 +132,7 @@ def choose_scheduler_inputs(
 ) -> SchedulerInputs:
     """Choose a bounded chunk size from the measured machine budget instead of assuming the whole clip fits in RAM."""
 
-    thread_limit = 1
+    import psutil
     precision_bytes = 4
     native_buffer_multiplier = {
         ResourcePolicy.CONSERVATIVE: 2.0,
@@ -148,11 +148,16 @@ def choose_scheduler_inputs(
         ResourcePolicy.BALANCED: 0.5,
         ResourcePolicy.AGGRESSIVE: 0.65,
     }[intent.resource_policy]
-    chunk_cap = {
-        ResourcePolicy.CONSERVATIVE: 24,
-        ResourcePolicy.BALANCED: 48,
-        ResourcePolicy.AGGRESSIVE: 96,
-    }[intent.resource_policy]
+    cpu_count = psutil.cpu_count(logical=True) or 4
+    if intent.resource_policy == ResourcePolicy.AGGRESSIVE:
+        thread_limit = max(1, cpu_count - 1)
+        chunk_cap = min(256, max(96, int(admissible_ram_bytes // (128 * 1024 * 1024))))
+    elif intent.resource_policy == ResourcePolicy.BALANCED:
+        thread_limit = min(4, cpu_count // 2)
+        chunk_cap = 48
+    else:
+        thread_limit = 1
+        chunk_cap = 24
     probe_inputs = PreflightInputs(
         intent=intent,
         source=source,
