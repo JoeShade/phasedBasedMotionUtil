@@ -669,6 +669,38 @@ def test_main_window_ignores_persisted_output_folder_for_startup_default(
     assert output_folder == tmp_path / "output"
 
 
+def test_main_window_migrates_legacy_temp_root_to_repo_local_temp(tmp_path: Path) -> None:
+    app = _app()
+    state = main_window_module.PersistedAppState(
+        preferences=main_window_module.default_preferences(tmp_path),
+    )
+    state = state.__class__(
+        preferences=state.preferences.__class__(
+            temp_root=str(tmp_path / "scratch"),
+            diagnostics_root=state.preferences.diagnostics_root,
+            diagnostic_level=state.preferences.diagnostic_level,
+            diagnostics_cap_mb=state.preferences.diagnostics_cap_mb,
+            retention_budget_gb=state.preferences.retention_budget_gb,
+        ),
+        last_used=state.last_used,
+        version=state.version,
+    )
+    main_window_module.save_app_state(tmp_path / "settings.json", state)
+    window = MainWindow(state_path=tmp_path / "settings.json")
+
+    try:
+        temp_root = Path(window._preferences.temp_root)
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert temp_root == tmp_path / "temp"
+    assert temp_root.exists()
+    assert os.environ["TEMP"] == str(temp_root)
+
+
 def test_main_window_builds_render_request_in_timestamped_output_subfolder(
     tmp_path: Path,
     monkeypatch,
@@ -752,10 +784,12 @@ def test_main_window_start_render_reaches_complete_and_prepare_new_run(tmp_path:
         assert window._controller.state is UiState.COMPLETE
         assert window.state_label.text() == "Complete"
         assert fake_supervisor.closed is True
+        assert window.eta_label.text() == "-"
 
         window._prepare_new_run()
         assert window._controller.state is UiState.READY
         assert window.state_label.text() == "Ready"
+        assert window.eta_label.text() == "-"
     finally:
         window.close()
         window.deleteLater()
@@ -1233,10 +1267,13 @@ def test_main_window_sync_render_metrics_resets_when_stage_counter_restarts(
 
     try:
         window._render_started_at = time.monotonic() - 2.0
+        window._progress_metric_stage = "decode"
+        window._progress_metric_total_frames = 860
         window._last_progress_frame_count = 860
         window._last_progress_at = time.monotonic() - 1.0
         window._mean_seconds_per_frame = 0.5
         window.mean_frame_label.setText("0.500 s")
+        window.eta_label.setText("10.0 s")
 
         window._sync_render_metrics(
             RenderSupervisorSnapshot(
@@ -1255,6 +1292,138 @@ def test_main_window_sync_render_metrics_resets_when_stage_counter_restarts(
     assert window._last_progress_frame_count == 0
     assert window._mean_seconds_per_frame is None
     assert window.mean_frame_label.text() == "-"
+    assert window.eta_label.text() == "Estimating..."
+
+
+def test_main_window_sync_render_metrics_updates_eta_from_stage_progress(
+    tmp_path: Path,
+) -> None:
+    app = _app()
+    window = _ready_window(tmp_path)
+
+    try:
+        now = time.monotonic()
+        window._render_started_at = now - 5.0
+        window._progress_metric_stage = "phase_processing"
+        window._progress_metric_total_frames = 60
+        window._last_progress_frame_count = 10
+        window._last_progress_at = now - 2.0
+        window._mean_seconds_per_frame = None
+
+        window._sync_render_metrics(
+            RenderSupervisorSnapshot(
+                phase="rendering",
+                stage="phase_processing",
+                frames_completed=20,
+                total_frames=60,
+            )
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert window.mean_frame_label.text() in {"0.200 s", "0.201 s"}
+    assert window.eta_label.text() == "8.0 s"
+
+
+def test_main_window_phase_processing_eta_uses_token_progress_before_batch_completion(
+    tmp_path: Path,
+) -> None:
+    app = _app()
+    window = _ready_window(tmp_path)
+
+    try:
+        now = time.monotonic()
+        window._render_started_at = now - 5.0
+        window._progress_metric_stage = "phase_processing"
+        window._progress_metric_total_frames = 100
+        window._last_progress_frame_count = 20.0
+        window._last_progress_at = now - 2.0
+        window._mean_seconds_per_frame = None
+
+        window._consume_render_event_for_metrics(
+            RenderEvent(
+                message_type="progress_update",
+                payload={
+                    "stage": "phase_processing",
+                    "detail": "decode_chunk_ready",
+                    "progress_token": "decode_chunk:20",
+                    "decode_frames_completed": 20,
+                },
+                received_at=now - 1.5,
+            )
+        )
+        window._consume_render_event_for_metrics(
+            RenderEvent(
+                message_type="progress_update",
+                payload={
+                    "stage": "phase_processing",
+                    "detail": "decode_chunk_ready",
+                    "progress_token": "decode_chunk:40",
+                    "decode_frames_completed": 40,
+                },
+                received_at=now - 1.0,
+            )
+        )
+        window._consume_render_event_for_metrics(
+            RenderEvent(
+                message_type="progress_update",
+                payload={
+                    "stage": "phase_processing",
+                    "detail": "warp_frame_10_of_20",
+                    "progress_token": "phase_processing:20:9",
+                },
+                received_at=now,
+            )
+        )
+
+        window._sync_render_metrics(
+            RenderSupervisorSnapshot(
+                phase="rendering",
+                stage="phase_processing",
+                frames_completed=20,
+                total_frames=100,
+            )
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert window.mean_frame_label.text() == "0.120 s"
+    assert window.eta_label.text() == "7.6 s"
+
+
+def test_main_window_phase_processing_token_progress_stays_monotonic_across_overlap(
+    tmp_path: Path,
+) -> None:
+    app = _app()
+    window = _ready_window(tmp_path)
+
+    try:
+        window._phase_nominal_chunk_frame_count = 20
+        window._phase_virtual_frames_completed = 40.0
+        window._consume_render_event_for_metrics(
+            RenderEvent(
+                message_type="progress_update",
+                payload={
+                    "stage": "phase_processing",
+                    "detail": "motion_grid_tile_2_of_4",
+                    "progress_token": "phase_processing:20:5",
+                },
+                received_at=time.monotonic(),
+            )
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert window._phase_virtual_frames_completed == 40.0
 
 
 def test_preflight_warning_dialog_keeps_warning_details_visible() -> None:

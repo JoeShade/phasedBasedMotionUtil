@@ -6,6 +6,8 @@ launch_stderr.log
 diagnostics/
 scratch/
 _analysis/
+temp/*
+!temp/.gitkeep
 
 # Repo-local source/output staging
 input/*

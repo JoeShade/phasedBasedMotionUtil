@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 
 from phase_motion_app.core.drift import DriftAssessment
+from phase_motion_app.core.masking import scale_zone_to_domain
 from phase_motion_app.core.models import (
     AnalysisBandMode,
     AnalysisSettings,
@@ -123,6 +124,7 @@ class _GeneratedBand:
 
 _ANALYSIS_QUEUE_SENTINEL = object()
 _ANALYSIS_INTERNAL_BATCH_FRAMES = 8
+_ANALYSIS_RESOLUTION_MAX_PIXELS = 700_000
 
 
 class _StreamingMotionFieldAnalyzer:
@@ -295,6 +297,7 @@ class StreamingQuantitativeAnalyzer:
         reference_luma: np.ndarray,
         exclusion_zones: tuple[ExclusionZone, ...],
         drift_assessment: DriftAssessment,
+        source_resolution: Resolution | None = None,
     ) -> None:
         self._settings = settings
         self._processing_resolution = processing_resolution
@@ -305,12 +308,23 @@ class StreamingQuantitativeAnalyzer:
         self._roi = _normalize_roi_zone(settings.roi)
         self._roi_mode = "whole_frame" if self._roi is None else "manual"
         self._roi_label = "Whole-frame ROI" if self._roi is None else "Manual ROI"
+        zone_source_resolution = (
+            processing_resolution if source_resolution is None else source_resolution
+        )
+        scaled_exclusion_zones = tuple(
+            scale_zone_to_domain(
+                zone,
+                zone_source_resolution,
+                processing_resolution,
+            )
+            for zone in exclusion_zones
+        )
         self._layout = _build_dense_layout(processing_resolution)
         self._base_cells = _build_base_cells(
             layout=self._layout,
             processing_resolution=processing_resolution,
             roi=self._roi,
-            exclusion_zones=exclusion_zones,
+            exclusion_zones=scaled_exclusion_zones,
         )
         self._roi_cell_map = _group_roi_cells(
             base_cells=self._base_cells,
@@ -442,13 +456,16 @@ class StreamingQuantitativeAnalyzer:
             reported_peaks=reported_peaks,
             low_hz=self._low_hz,
             high_hz=self._high_hz,
+            roi_cell_records=roi_cell_records,
         )
         heatmaps, heatmap_scale = _build_heatmaps(
             base_cells=self._base_cells,
             base_spectra=base_spectra,
+            base_metrics=base_metrics,
             confidence_mean=confidence_mean,
             frequencies=frequencies,
             bands=bands,
+            roi_cell_records=roi_cell_records,
             low_confidence_threshold=self._settings.low_confidence_threshold,
         )
         roi_trace = _aggregate_roi_trace(roi_cell_records)
@@ -480,6 +497,7 @@ class StreamingQuantitativeAnalyzer:
             "roi_mode": self._roi_mode,
             "roi_label": self._roi_label,
             "roi_geometry": None if self._roi is None else self._roi.to_dict(),
+            "analysis_resolution": self._processing_resolution.to_dict(),
             "roi_quality_score": roi_quality["overall_quality_score"],
             "confidence_label": roi_quality["confidence_label"],
             "reported_peaks": [peak.to_dict() for peak in reported_peaks],
@@ -527,6 +545,7 @@ def build_disabled_analysis_export(settings: AnalysisSettings) -> QuantitativeAn
         "roi_mode": "whole_frame" if settings.roi is None else "manual",
         "roi_label": "Whole-frame ROI" if settings.roi is None else "Manual ROI",
         "roi_geometry": None if settings.roi is None else settings.roi.to_dict(),
+        "analysis_resolution": None,
         "reported_peaks": [],
         "bands": [],
         "artifact_paths": {},
@@ -567,6 +586,7 @@ def build_empty_analysis_export(
         "roi_mode": roi_mode,
         "roi_label": roi_label,
         "roi_geometry": None if roi is None else roi.to_dict(),
+        "analysis_resolution": None,
         "roi_quality_score": 0.0,
         "confidence_label": "Unavailable",
         "reported_peaks": [],
@@ -616,11 +636,15 @@ def _normalize_roi_zone(roi: ExclusionZone | None) -> ExclusionZone | None:
 
 
 def _build_dense_layout(resolution: Resolution) -> _MotionGridLayout:
-    rows = int(np.clip(round(resolution.height / 72.0), 4, 14))
-    columns = int(np.clip(round(resolution.width / 72.0), 4, 14))
+    # Keep the analysis grid denser than the render-motion grid so exported
+    # heatmaps can still localize smaller vibrating subjects at reduced
+    # processing resolutions such as 405x720. The previous 72 px heuristic made
+    # cells large enough to blend the engine bay with the front crossmember.
+    rows = int(np.clip(round(resolution.height / 60.0), 6, 16))
+    columns = int(np.clip(round(resolution.width / 60.0), 6, 10))
     cell_height = resolution.height / rows
     cell_width = resolution.width / columns
-    tile_size = int(round(min(cell_height, cell_width) * 1.7))
+    tile_size = int(round(min(cell_height, cell_width) * 1.45))
     tile_size = max(12, min(tile_size, min(resolution.width, resolution.height)))
     if tile_size % 2 != 0:
         tile_size += -1 if tile_size == min(resolution.width, resolution.height) else 1
@@ -629,6 +653,42 @@ def _build_dense_layout(resolution: Resolution) -> _MotionGridLayout:
         row_starts=tuple(_evenly_spaced_starts(resolution.height, tile_size, rows)),
         column_starts=tuple(_evenly_spaced_starts(resolution.width, tile_size, columns)),
     )
+
+
+def choose_quantitative_analysis_resolution(
+    *,
+    source_resolution: Resolution,
+    processing_resolution: Resolution,
+) -> Resolution:
+    """Choose a bounded analysis resolution that preserves localization better than the phase-processing resolution.
+
+    Heatmaps care more about spatial localization than the amplified render path
+    does. When the render is intentionally run at a reduced processing
+    resolution, analysis can safely use a somewhat richer bounded resolution so
+    small vibrating subjects do not collapse into a few coarse cells.
+    """
+
+    processing_pixels = processing_resolution.width * processing_resolution.height
+    source_pixels = source_resolution.width * source_resolution.height
+    if source_pixels <= processing_pixels:
+        return processing_resolution
+    if source_pixels <= _ANALYSIS_RESOLUTION_MAX_PIXELS:
+        return source_resolution
+
+    scale = math.sqrt(_ANALYSIS_RESOLUTION_MAX_PIXELS / max(source_pixels, 1))
+    scaled_width = max(2, int(round(source_resolution.width * scale)))
+    scaled_height = max(2, int(round(source_resolution.height * scale)))
+    if scaled_width % 2 != 0:
+        scaled_width -= 1
+    if scaled_height % 2 != 0:
+        scaled_height -= 1
+    chosen = Resolution(
+        width=max(2, scaled_width),
+        height=max(2, scaled_height),
+    )
+    if (chosen.width * chosen.height) < processing_pixels:
+        return processing_resolution
+    return chosen
 
 
 def _evenly_spaced_starts(length: int, tile_size: int, count: int) -> list[int]:
@@ -1310,6 +1370,7 @@ def _resolve_bands(
     reported_peaks: tuple[_PeakRecord, ...],
     low_hz: float,
     high_hz: float,
+    roi_cell_records: tuple[_RoiCellRecord, ...] = (),
 ) -> tuple[tuple[_GeneratedBand, ...], tuple[str, ...]]:
     if settings.band_mode is AnalysisBandMode.MANUAL_SINGLE:
         manual_bands = settings.manual_bands[:1]
@@ -1349,27 +1410,42 @@ def _resolve_bands(
             (),
         )
 
-    candidate_frequencies = [
-        peak.frequency_hz
+    auto_search_high_hz = _auto_band_peak_search_high_hz(
+        frequencies=frequencies,
+        low_hz=low_hz,
+        high_hz=high_hz,
+    )
+    candidate_peaks = [
+        peak
         for peak in reported_peaks
-        if low_hz <= peak.frequency_hz <= high_hz
+        if low_hz <= peak.frequency_hz <= auto_search_high_hz
     ]
-    if not candidate_frequencies:
+    if not candidate_peaks:
         peak_indices = _find_peak_indices(roi_spectrum, frequencies)
-        candidate_frequencies = [
-            float(frequencies[index])
+        candidate_peaks = [
+            _PeakRecord(
+                frequency_hz=float(frequencies[index]),
+                amplitude=float(roi_spectrum[index]),
+                support_fraction=0.0,
+                ranking_score=float(roi_spectrum[index]),
+            )
             for index in peak_indices
-            if low_hz <= float(frequencies[index]) <= high_hz
+            if low_hz <= float(frequencies[index]) <= auto_search_high_hz
         ]
+    cover_band = _build_cover_band_for_wide_auto_range(
+        candidate_frequencies=[peak.frequency_hz for peak in candidate_peaks],
+        low_hz=low_hz,
+        high_hz=high_hz,
+    )
     bands: list[_GeneratedBand] = []
     merge_steps: list[str] = []
-    for band_number, peak_hz in enumerate(candidate_frequencies[: settings.auto_band_count], start=1):
+    for band_number, peak in enumerate(candidate_peaks[: settings.auto_band_count + 2], start=1):
         low_edge, high_edge = _estimate_band_edges(
-            peak_hz=peak_hz,
+            peak_hz=peak.frequency_hz,
             roi_spectrum=roi_spectrum,
             frequencies=frequencies,
             low_hz=low_hz,
-            high_hz=high_hz,
+            high_hz=auto_search_high_hz,
         )
         bands.append(
             _clamp_generated_band_to_requested_range(
@@ -1378,10 +1454,10 @@ def _resolve_bands(
                     low_hz=low_edge,
                     high_hz=high_edge,
                     mode=settings.band_mode.value,
-                    source_peak_hz=peak_hz,
+                    source_peak_hz=peak.frequency_hz,
                 ),
                 low_hz=low_hz,
-                high_hz=high_hz,
+                high_hz=auto_search_high_hz,
             )
         )
     if not bands:
@@ -1393,12 +1469,12 @@ def _resolve_bands(
                 _GeneratedBand(
                     band_id="band01",
                     low_hz=max(low_hz, center - half_width),
-                    high_hz=min(high_hz, center + half_width),
+                    high_hz=min(auto_search_high_hz, center + half_width),
                     mode=settings.band_mode.value,
                     source_peak_hz=center,
                 ),
                 low_hz=low_hz,
-                high_hz=high_hz,
+                high_hz=auto_search_high_hz,
             )
         )
     bands = _split_auto_bands_at_clear_valleys(
@@ -1410,7 +1486,7 @@ def _resolve_bands(
         _clamp_generated_band_to_requested_range(
             band,
             low_hz=low_hz,
-            high_hz=high_hz,
+            high_hz=auto_search_high_hz,
         )
         for band in bands
     ]
@@ -1440,7 +1516,185 @@ def _resolve_bands(
             )
             continue
         merged.append(band)
-    return tuple(merged[: settings.auto_band_count]), tuple(merge_steps)
+    ranked_narrow = sorted(
+        merged,
+        key=lambda band: _auto_band_display_score(
+            band=band,
+            candidate_peaks=tuple(candidate_peaks),
+            roi_cell_records=roi_cell_records,
+            frequencies=frequencies,
+            low_hz=low_hz,
+            high_hz=high_hz,
+        ),
+        reverse=True,
+    )
+    ordered = ranked_narrow[: settings.auto_band_count]
+    if cover_band is not None and len(ordered) < settings.auto_band_count:
+        ordered.append(cover_band)
+    renumbered = [
+        _GeneratedBand(
+            band_id=f"band{index:02d}",
+            low_hz=band.low_hz,
+            high_hz=band.high_hz,
+            mode=band.mode,
+            source_peak_hz=band.source_peak_hz,
+        )
+        for index, band in enumerate(ordered[: settings.auto_band_count], start=1)
+    ]
+    return tuple(renumbered), tuple(merge_steps)
+
+
+def _build_cover_band_for_wide_auto_range(
+    *,
+    candidate_frequencies: list[float],
+    low_hz: float,
+    high_hz: float,
+) -> _GeneratedBand | None:
+    """Add one wide cover band when a broad requested range contains several separated supported peaks.
+
+    Narrow auto-bands are good for clips with one compact mode, but engine-style
+    vibration often spreads across a family of harmonics. A single cover band
+    lets the primary heatmap show that whole vibrating region instead of forcing
+    the analysis to pick one narrow stripe.
+    """
+
+    span = high_hz - low_hz
+    if span < 1.5 or len(candidate_frequencies) < 3:
+        return None
+    sorted_frequencies = sorted(candidate_frequencies)
+    frequency_spread = sorted_frequencies[-1] - sorted_frequencies[0]
+    if frequency_spread < max(1.0, span * 0.35):
+        return None
+    return _GeneratedBand(
+        band_id="band01",
+        low_hz=low_hz,
+        high_hz=high_hz,
+        mode="auto",
+        source_peak_hz=None,
+    )
+
+
+def _auto_band_peak_search_high_hz(
+    *,
+    frequencies: np.ndarray,
+    low_hz: float,
+    high_hz: float,
+) -> float:
+    """Allow auto-band discovery to look slightly above the requested high edge on wide/high-frequency runs.
+
+    Engine-style vibration often lands right at or slightly above the operator's
+    practical render band. A small guard band lets analysis still pick the
+    localized peak instead of collapsing to a broader lower-frequency shelf.
+    """
+
+    if len(frequencies) <= 1:
+        return high_hz
+    if high_hz < 1.0 or (high_hz - low_hz) < 1.0:
+        return high_hz
+    bin_width = float(frequencies[1] - frequencies[0])
+    max_frequency = float(frequencies[-1])
+    guard_hz = max(0.75, bin_width * 6.0)
+    return float(min(max_frequency, high_hz + guard_hz))
+
+
+def _auto_band_display_score(
+    *,
+    band: _GeneratedBand,
+    candidate_peaks: tuple[_PeakRecord, ...],
+    roi_cell_records: tuple[_RoiCellRecord, ...],
+    frequencies: np.ndarray,
+    low_hz: float,
+    high_hz: float,
+) -> float:
+    """Rank narrow auto-bands for display by combining peak strength with spatial localization.
+
+    The broad requested render band is useful for processing, but the first
+    displayed heatmap should usually be the band that best localizes the moving
+    subject, not the broadest umbrella band.
+    """
+
+    peak_component = _band_peak_ranking_component(
+        band=band,
+        candidate_peaks=candidate_peaks,
+        frequencies=frequencies,
+    )
+    localization = _band_localization_score(
+        band=band,
+        roi_cell_records=roi_cell_records,
+        frequencies=frequencies,
+    )
+    span = max(high_hz - low_hz, 1e-6)
+    width = max(band.high_hz - band.low_hz, 1e-6)
+    specificity = float(np.clip(1.0 - (width / max(span, width)), 0.0, 1.0))
+    score = (
+        0.45 * peak_component
+        + 0.40 * localization
+        + 0.15 * specificity
+    )
+    if band.source_peak_hz is None:
+        score -= 0.25
+    return float(score)
+
+
+def _band_peak_ranking_component(
+    *,
+    band: _GeneratedBand,
+    candidate_peaks: tuple[_PeakRecord, ...],
+    frequencies: np.ndarray,
+) -> float:
+    """Return the strongest peak-ranking contribution covered by one generated band."""
+
+    tolerance_hz = float(frequencies[1] - frequencies[0]) if len(frequencies) > 1 else 0.0
+    matching = [
+        peak.ranking_score
+        for peak in candidate_peaks
+        if (band.low_hz - tolerance_hz) <= peak.frequency_hz <= (band.high_hz + tolerance_hz)
+    ]
+    if matching:
+        return float(max(matching))
+    if band.source_peak_hz is None:
+        return 0.0
+    closest = min(
+        candidate_peaks,
+        key=lambda peak: abs(peak.frequency_hz - band.source_peak_hz),
+        default=None,
+    )
+    return 0.0 if closest is None else float(closest.ranking_score)
+
+
+def _band_localization_score(
+    *,
+    band: _GeneratedBand,
+    roi_cell_records: tuple[_RoiCellRecord, ...],
+    frequencies: np.ndarray,
+) -> float:
+    """Measure how strongly one band concentrates into a limited set of valid ROI cells."""
+
+    valid_records = [record for record in roi_cell_records if record.valid]
+    if not valid_records:
+        return 0.0
+    band_mask = (frequencies >= band.low_hz) & (frequencies <= band.high_hz)
+    if int(np.count_nonzero(band_mask)) <= 0:
+        return 0.0
+    weighted_energy = np.array(
+        [
+            float(np.sum(np.square(record.spectrum[band_mask]))) * max(record.composite_quality, 0.05)
+            for record in valid_records
+        ],
+        dtype=np.float32,
+    )
+    positive = weighted_energy[weighted_energy > 1e-12]
+    if positive.size <= 1:
+        return 0.0
+    mean_energy = float(np.mean(positive))
+    if mean_energy <= 1e-12:
+        return 0.0
+    top_count = min(3, positive.size)
+    top_mean = float(np.mean(np.sort(positive)[-top_count:]))
+    percentile_95 = float(np.percentile(positive, 95.0))
+    concentration = np.clip((top_mean / mean_energy - 1.0) / 6.0, 0.0, 1.0)
+    hotspot = np.clip((percentile_95 / mean_energy - 1.0) / 6.0, 0.0, 1.0)
+    return float((0.55 * concentration) + (0.45 * hotspot))
 
 
 def _clamp_generated_band_to_requested_range(
@@ -1574,16 +1828,51 @@ def _estimate_band_edges(
         center = float(frequencies[peak_index])
         estimated_low = max(low_hz, center - (max_width / 2.0))
         estimated_high = min(high_hz, center + (max_width / 2.0))
-    return estimated_low, estimated_high
+    return _expand_floor_adjacent_low_frequency_band(
+        estimated_low=estimated_low,
+        estimated_high=estimated_high,
+        peak_hz=float(frequencies[peak_index]),
+        low_hz=low_hz,
+        high_hz=high_hz,
+    )
+
+
+def _expand_floor_adjacent_low_frequency_band(
+    *,
+    estimated_low: float,
+    estimated_high: float,
+    peak_hz: float,
+    low_hz: float,
+    high_hz: float,
+) -> tuple[float, float]:
+    """Keep more of a narrow low-frequency window when the chosen peak hugs the floor.
+
+    Breathing-style clips often produce a supported peak near the low search edge
+    plus weaker support a bit higher in the same family. If the auto band snaps
+    too tightly around the floor-adjacent peak, the heatmap misses the upper
+    half of that breathing band. This guard keeps a little more headroom.
+    """
+
+    requested_span = high_hz - low_hz
+    if requested_span <= 0.0 or requested_span > 0.75:
+        return estimated_low, estimated_high
+    if peak_hz > low_hz + (requested_span * 0.25):
+        return estimated_low, estimated_high
+    guarded_high = min(high_hz, low_hz + (requested_span * 0.65))
+    if estimated_high >= guarded_high:
+        return estimated_low, estimated_high
+    return low_hz, guarded_high
 
 
 def _build_heatmaps(
     *,
     base_cells: list[_BaseCell],
     base_spectra: np.ndarray,
+    base_metrics: dict[str, np.ndarray] | None = None,
     confidence_mean: np.ndarray,
     frequencies: np.ndarray,
     bands: tuple[_GeneratedBand, ...],
+    roi_cell_records: tuple[_RoiCellRecord, ...] = (),
     low_confidence_threshold: float,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     total_energy = np.sum(np.square(base_spectra), axis=0)
@@ -1593,17 +1882,33 @@ def _build_heatmaps(
     all_valid_values: list[float] = []
     all_valid_band_energy: list[float] = []
     clipped_cell_count = 0
+    if base_metrics is None:
+        default_metric = np.ones(len(base_cells), dtype=np.float32)
+        base_metrics = {
+            "trace_stability": default_metric,
+            "component_agreement": default_metric,
+            "band_relevance": default_metric,
+        }
+    quality_by_roi_cell_id = {
+        record.cell_id: _heatmap_roi_cell_quality(record) for record in roi_cell_records
+    }
+    effective_confidence_threshold = _heatmap_effective_confidence_threshold(
+        base_cells=base_cells,
+        confidence_mean=confidence_mean,
+        low_confidence_threshold=low_confidence_threshold,
+    )
     weak_signal_floor = _heatmap_weak_signal_floor(
         total_energy=total_energy,
         base_cells=base_cells,
         confidence_mean=confidence_mean,
-        low_confidence_threshold=low_confidence_threshold,
+        low_confidence_threshold=effective_confidence_threshold,
     )
 
     for band in bands:
         grid = np.full((grid_rows, grid_columns), np.nan, dtype=np.float32)
         band_energy_grid = np.full((grid_rows, grid_columns), np.nan, dtype=np.float32)
         confidence_grid = np.zeros((grid_rows, grid_columns), dtype=np.float32)
+        quality_grid = np.zeros((grid_rows, grid_columns), dtype=np.float32)
         low_confidence_mask = np.zeros((grid_rows, grid_columns), dtype=bool)
         reason_summary = {
             "outside_roi": 0,
@@ -1619,6 +1924,14 @@ def _build_heatmaps(
             confidence_grid[cell.row_index, cell.column_index] = np.float32(
                 max(float(confidence_mean[index]), 0.0)
             )
+            quality_grid[cell.row_index, cell.column_index] = np.float32(
+                _heatmap_base_cell_quality(
+                    base_cell=cell,
+                    base_index=index,
+                    base_metrics=base_metrics,
+                    quality_by_roi_cell_id=quality_by_roi_cell_id,
+                )
+            )
             band_energy = float(np.sum(np.square(base_spectra[band_mask, index])))
             normalized_energy = 0.0 if float(total_energy[index]) <= 1e-6 else band_energy / float(total_energy[index])
             grid[cell.row_index, cell.column_index] = np.float32(normalized_energy)
@@ -1627,7 +1940,7 @@ def _build_heatmaps(
                 low_confidence_mask[cell.row_index, cell.column_index] = True
                 reason_summary["masked_out"] += 1
                 continue
-            if float(confidence_mean[index]) < low_confidence_threshold:
+            if float(confidence_mean[index]) < effective_confidence_threshold:
                 low_confidence_mask[cell.row_index, cell.column_index] = True
                 reason_summary["low_confidence"] += 1
                 continue
@@ -1644,6 +1957,7 @@ def _build_heatmaps(
             "grid": grid,
             "band_energy_grid": band_energy_grid,
             "confidence_grid": confidence_grid,
+            "quality_grid": quality_grid,
             "low_confidence_mask": low_confidence_mask,
             "low_confidence_count": int(low_confidence_mask.sum()),
             "reason_summary": reason_summary,
@@ -1680,37 +1994,14 @@ def _build_heatmaps(
 
     band_energy_scale = max(band_energy_display_max - band_energy_display_min, 1e-12)
     for item in heatmaps.values():
-        band_energy_grid = item["band_energy_grid"]
-        confidence_grid = item["confidence_grid"]
-        salience_grid = np.zeros_like(band_energy_grid, dtype=np.float32)
-        finite_mask = np.isfinite(band_energy_grid)
-        if np.any(finite_mask):
-            normalized_band_energy = np.clip(
-                (band_energy_grid[finite_mask] - np.float32(band_energy_display_min))
-                / np.float32(band_energy_scale),
-                0.0,
-                1.0,
-            )
-            # Keep the normalized heatmap values as the primary data, but fade
-            # cells that are only marginally trustworthy so the display stays
-            # focused on coherent motion instead of lighting or texture noise.
-            confidence_visibility = np.sqrt(
-                np.clip(confidence_grid[finite_mask], 0.0, 1.0)
-            ).astype(
-                np.float32,
-                copy=False,
-            )
-            salience_grid[finite_mask] = (
-                np.sqrt(normalized_band_energy).astype(
-                    np.float32,
-                    copy=False,
-                )
-                * confidence_visibility
-            ).astype(
-                np.float32,
-                copy=False,
-            )
-        item["band_salience_grid"] = salience_grid
+        item["band_salience_grid"] = _build_heatmap_salience_grid(
+            grid=item["grid"],
+            band_energy_grid=item["band_energy_grid"],
+            confidence_grid=item["confidence_grid"],
+            quality_grid=item["quality_grid"],
+            band_energy_display_min=band_energy_display_min,
+            band_energy_scale=band_energy_scale,
+        )
 
     return heatmaps, {
         "normalization_method": "robust_percentile",
@@ -1741,6 +2032,180 @@ def _heatmap_weak_signal_floor(
         return 0.0
     reference_energy = float(np.percentile(eligible_energy, 75.0))
     return max(reference_energy * 0.05, 1e-8)
+
+
+def _heatmap_effective_confidence_threshold(
+    *,
+    base_cells: list[_BaseCell],
+    confidence_mean: np.ndarray,
+    low_confidence_threshold: float,
+) -> float:
+    """Relax the fixed low-confidence cutoff on subtle-vibration clips so one quiet but coherent subject is not turned monochrome just because the whole grid is lower contrast than a large-motion clip."""
+
+    eligible_confidence = [
+        float(confidence_mean[index])
+        for index, cell in enumerate(base_cells)
+        if cell.roi_fraction > 0.0 and cell.usable_fraction >= 0.35
+    ]
+    if len(eligible_confidence) < 4:
+        return low_confidence_threshold
+    adaptive_threshold = max(
+        0.08,
+        float(np.percentile(eligible_confidence, 70.0)) * 0.85,
+    )
+    return float(min(low_confidence_threshold, adaptive_threshold))
+
+
+def _build_heatmap_salience_grid(
+    *,
+    grid: np.ndarray,
+    band_energy_grid: np.ndarray,
+    confidence_grid: np.ndarray,
+    quality_grid: np.ndarray,
+    band_energy_display_min: float,
+    band_energy_scale: float,
+) -> np.ndarray:
+    """Blend absolute band energy with band-specific dominance, local support, and ROI-cell quality.
+
+    Raw base-cell energy alone tends to reward tiny textured edges. The added
+    support and quality terms make a coherent vibrating region earn opacity more
+    easily than one isolated high-texture edge cell.
+    """
+
+    salience_grid = np.zeros_like(band_energy_grid, dtype=np.float32)
+    finite_mask = np.isfinite(band_energy_grid)
+    if not np.any(finite_mask):
+        return salience_grid
+
+    normalized_band_energy = np.clip(
+        (band_energy_grid[finite_mask] - np.float32(band_energy_display_min))
+        / np.float32(band_energy_scale),
+        0.0,
+        1.0,
+    )
+    normalized_band_dominance = np.sqrt(
+        np.clip(grid[finite_mask], 0.0, 1.0)
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+    confidence_visibility = np.sqrt(
+        np.clip(confidence_grid[finite_mask], 0.0, 1.0)
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+    local_support_grid = _build_heatmap_local_support_grid(
+        np.where(
+            np.isfinite(grid),
+            np.clip(grid, 0.0, 1.0) * np.clip(quality_grid, 0.0, 1.0),
+            np.nan,
+        ).astype(np.float32, copy=False)
+    )
+    local_support = np.sqrt(
+        np.clip(local_support_grid[finite_mask], 0.0, 1.0)
+    ).astype(np.float32, copy=False)
+    quality_visibility = np.sqrt(
+        np.clip(quality_grid[finite_mask], 0.0, 1.0)
+    ).astype(np.float32, copy=False)
+    # Absolute energy still matters, but make cells earn opacity by also
+    # belonging to a coherent local patch with decent ROI-cell quality. That
+    # keeps broadband or low-quality edge cells from visually outranking the
+    # actual vibrating subject.
+    salience_grid[finite_mask] = (
+        np.sqrt(normalized_band_energy).astype(np.float32, copy=False)
+        * (
+            np.float32(0.12)
+            + (np.float32(0.36) * normalized_band_dominance)
+            + (np.float32(0.30) * local_support)
+            + (np.float32(0.22) * quality_visibility)
+        )
+        * confidence_visibility
+        * quality_visibility
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+    return salience_grid
+
+
+def _heatmap_roi_cell_quality(record: _RoiCellRecord) -> float:
+    """Collapse one ROI-cell record into one bounded display weight.
+
+    The quantitative-analysis export already decides which larger ROI cells look
+    coherent and trustworthy. Reusing that judgement in the heatmap renderer
+    stops the fine base-cell view from ignoring higher-level quality checks.
+    """
+
+    quality = float(
+        np.clip(
+            (
+                0.45 * record.composite_quality
+                + 0.20 * record.trace_stability
+                + 0.15 * record.component_agreement
+                + 0.20 * record.band_relevance
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    if not record.valid:
+        quality *= 0.60
+    if record.hard_fail:
+        quality *= 0.50
+    return float(np.clip(quality, 0.05, 1.0))
+
+
+def _heatmap_base_cell_quality(
+    *,
+    base_cell: _BaseCell,
+    base_index: int,
+    base_metrics: dict[str, np.ndarray],
+    quality_by_roi_cell_id: dict[str, float],
+) -> float:
+    """Blend parent ROI-cell quality with base-cell stability so localized heatmaps stay honest."""
+
+    parent_quality = quality_by_roi_cell_id.get(base_cell.roi_cell_id or "", 0.50)
+    local_quality = float(
+        np.clip(
+            (
+                0.55 * parent_quality
+                + 0.25 * float(base_metrics["trace_stability"][base_index])
+                + 0.20 * float(base_metrics["component_agreement"][base_index])
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    return float(np.clip(local_quality * max(base_cell.usable_fraction, 0.10), 0.05, 1.0))
+
+
+def _build_heatmap_local_support_grid(values: np.ndarray) -> np.ndarray:
+    """Measure how much same-band support surrounds each cell.
+
+    A small vibrating subject usually lights up a compact patch, while a noisy
+    edge spike tends to stay isolated. This local mean gives the renderer a
+    simple deterministic way to tell those apart.
+    """
+
+    rows, columns = values.shape
+    support = np.zeros_like(values, dtype=np.float32)
+    finite_mask = np.isfinite(values)
+    for row_index in range(rows):
+        row_start = max(0, row_index - 1)
+        row_stop = min(rows, row_index + 2)
+        for column_index in range(columns):
+            if not finite_mask[row_index, column_index]:
+                support[row_index, column_index] = np.float32(0.0)
+                continue
+            column_start = max(0, column_index - 1)
+            column_stop = min(columns, column_index + 2)
+            window = values[row_start:row_stop, column_start:column_stop]
+            finite_window = window[np.isfinite(window)]
+            if finite_window.size == 0:
+                continue
+            support[row_index, column_index] = np.float32(np.mean(finite_window))
+    return support
 
 
 def _write_analysis_artifacts(

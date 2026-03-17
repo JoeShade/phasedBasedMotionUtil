@@ -607,6 +607,83 @@ def test_heatmap_overlay_fades_lower_confidence_cells_even_when_band_energy_matc
     assert float(overlay_alpha[0, 1]) > float(overlay_alpha[0, 0])
 
 
+def test_heatmap_salience_penalizes_broadband_cells_with_weaker_band_dominance() -> None:
+    salience = quantitative_analysis_module._build_heatmap_salience_grid(
+        grid=np.array([[0.80, 0.25]], dtype=np.float32),
+        band_energy_grid=np.array([[0.60, 0.80]], dtype=np.float32),
+        confidence_grid=np.array([[0.95, 0.95]], dtype=np.float32),
+        quality_grid=np.array([[0.95, 0.95]], dtype=np.float32),
+        band_energy_display_min=0.0,
+        band_energy_scale=1.0,
+    )
+
+    assert float(salience[0, 0]) > float(salience[0, 1])
+
+
+def test_heatmap_salience_prefers_supported_high_quality_patch_over_edge_spike() -> None:
+    salience = quantitative_analysis_module._build_heatmap_salience_grid(
+        grid=np.array(
+            [
+                [0.72, 0.05, 0.05],
+                [0.08, 0.66, 0.64],
+                [0.05, 0.62, 0.60],
+            ],
+            dtype=np.float32,
+        ),
+        band_energy_grid=np.array(
+            [
+                [0.95, 0.05, 0.05],
+                [0.08, 0.78, 0.76],
+                [0.05, 0.74, 0.72],
+            ],
+            dtype=np.float32,
+        ),
+        confidence_grid=np.full((3, 3), 0.95, dtype=np.float32),
+        quality_grid=np.array(
+            [
+                [0.20, 0.40, 0.40],
+                [0.40, 0.95, 0.95],
+                [0.40, 0.95, 0.95],
+            ],
+            dtype=np.float32,
+        ),
+        band_energy_display_min=0.0,
+        band_energy_scale=1.0,
+    )
+
+    assert float(salience[1, 1]) > float(salience[0, 0])
+    assert float(salience[2, 1]) > float(salience[0, 0])
+
+
+def test_heatmap_effective_confidence_threshold_relaxes_for_quiet_clip() -> None:
+    base_cells = [
+        quantitative_analysis_module._BaseCell(
+            cell_id=f"hm_r01_c0{index + 1}",
+            row_index=0,
+            column_index=index,
+            start_x=index * 8,
+            start_y=0,
+            width=8,
+            height=8,
+            center_x=(index * 8) + 4.0,
+            center_y=4.0,
+            roi_fraction=1.0,
+            usable_fraction=1.0,
+            excluded_fraction=0.0,
+            roi_cell_id=f"cell_r01_c0{index + 1}",
+        )
+        for index in range(4)
+    ]
+
+    threshold = quantitative_analysis_module._heatmap_effective_confidence_threshold(
+        base_cells=base_cells,
+        confidence_mean=np.array([0.12, 0.15, 0.18, 0.20], dtype=np.float32),
+        low_confidence_threshold=0.35,
+    )
+
+    assert 0.08 <= threshold < 0.20
+
+
 def test_visible_content_mask_suppresses_pillarbox_bars() -> None:
     frame = np.zeros((32, 48, 3), dtype=np.float32)
     frame[:, 10:38, :] = 0.6
@@ -621,6 +698,236 @@ def test_visible_content_mask_suppresses_pillarbox_bars() -> None:
     assert float(mask[:, :8].max()) == 0.0
     assert float(mask[:, -8:].max()) == 0.0
     assert float(mask[:, 14:34].min()) == 1.0
+
+
+def test_auto_band_resolution_adds_cover_band_for_wide_multi_peak_range() -> None:
+    frequencies = np.arange(1.0, 5.2, 0.2, dtype=np.float32)
+    roi_spectrum = np.zeros_like(frequencies)
+    for peak_hz, amplitude in ((1.6, 0.24), (2.8, 0.22), (4.0, 0.20)):
+        index = int(np.argmin(np.abs(frequencies - peak_hz)))
+        roi_spectrum[index] = amplitude
+
+    bands, _merge_steps = quantitative_analysis_module._resolve_bands(
+        settings=AnalysisSettings(auto_band_count=4),
+        roi_spectrum=roi_spectrum,
+        frequencies=frequencies,
+        reported_peaks=(
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=1.6,
+                amplitude=0.24,
+                support_fraction=0.8,
+                ranking_score=0.9,
+            ),
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=2.8,
+                amplitude=0.22,
+                support_fraction=0.75,
+                ranking_score=0.82,
+            ),
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=4.0,
+                amplitude=0.20,
+                support_fraction=0.70,
+                ranking_score=0.76,
+            ),
+        ),
+        low_hz=1.0,
+        high_hz=5.0,
+    )
+
+    assert bands
+    assert any(band.low_hz == 1.0 and band.high_hz == 5.0 for band in bands)
+
+
+def test_auto_band_resolution_promotes_localized_upper_edge_peak() -> None:
+    frequencies = np.arange(1.0, 6.1, 0.1, dtype=np.float32)
+    roi_spectrum = np.zeros_like(frequencies)
+    for peak_hz, amplitude in ((1.1, 0.30), (2.5, 0.26), (3.5, 0.24), (5.6, 0.23)):
+        index = int(np.argmin(np.abs(frequencies - peak_hz)))
+        roi_spectrum[index] = amplitude
+
+    def build_record(
+        cell_id: str,
+        *,
+        shared_scale: float,
+        localized_scale: float,
+    ) -> quantitative_analysis_module._RoiCellRecord:
+        spectrum = np.full_like(frequencies, 1.0e-6)
+        for peak_hz, amplitude in ((1.1, 0.30), (2.5, 0.26), (3.5, 0.24)):
+            index = int(np.argmin(np.abs(frequencies - peak_hz)))
+            spectrum[index] = amplitude * shared_scale
+        localized_index = int(np.argmin(np.abs(frequencies - 5.6)))
+        spectrum[localized_index] = 0.23 * localized_scale
+        return quantitative_analysis_module._RoiCellRecord(
+            cell_id=cell_id,
+            trace=np.zeros(16, dtype=np.float32),
+            spectrum=spectrum,
+            texture_adequacy=1.0,
+            trace_stability=1.0,
+            component_agreement=1.0,
+            band_relevance=1.0,
+            mask_impact=0.0,
+            drift_impact=0.0,
+            composite_quality=1.0,
+            valid=True,
+            hard_fail=False,
+            rejection_reasons=(),
+        )
+
+    bands, _merge_steps = quantitative_analysis_module._resolve_bands(
+        settings=AnalysisSettings(auto_band_count=4),
+        roi_spectrum=roi_spectrum,
+        frequencies=frequencies,
+        reported_peaks=(
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=1.1,
+                amplitude=0.30,
+                support_fraction=0.85,
+                ranking_score=0.86,
+            ),
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=2.5,
+                amplitude=0.26,
+                support_fraction=0.80,
+                ranking_score=0.80,
+            ),
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=3.5,
+                amplitude=0.24,
+                support_fraction=0.78,
+                ranking_score=0.76,
+            ),
+            quantitative_analysis_module._PeakRecord(
+                frequency_hz=5.6,
+                amplitude=0.23,
+                support_fraction=0.62,
+                ranking_score=0.72,
+            ),
+        ),
+        low_hz=1.0,
+        high_hz=5.0,
+        roi_cell_records=(
+            build_record("cell-a", shared_scale=1.0, localized_scale=14.0),
+            build_record("cell-b", shared_scale=1.0, localized_scale=9.0),
+            build_record("cell-c", shared_scale=1.1, localized_scale=0.2),
+            build_record("cell-d", shared_scale=1.0, localized_scale=0.1),
+            build_record("cell-e", shared_scale=0.9, localized_scale=0.1),
+            build_record("cell-f", shared_scale=0.8, localized_scale=0.05),
+        ),
+    )
+
+    assert bands
+    assert abs(bands[0].source_peak_hz - 5.6) < 0.25
+    assert any(band.source_peak_hz is not None and abs(band.source_peak_hz - 5.6) < 0.25 for band in bands)
+
+
+def test_estimate_band_edges_keeps_more_upper_span_for_floor_adjacent_low_peak() -> None:
+    frequencies = np.arange(0.15, 0.50, 0.05, dtype=np.float32)
+    roi_spectrum = np.array([0.18, 0.26, 0.20, 0.16, 0.10, 0.08, 0.05], dtype=np.float32)
+
+    low_edge, high_edge = quantitative_analysis_module._estimate_band_edges(
+        peak_hz=0.20,
+        roi_spectrum=roi_spectrum,
+        frequencies=frequencies,
+        low_hz=0.15,
+        high_hz=0.45,
+    )
+
+    assert low_edge == 0.15
+    assert high_edge >= 0.34
+
+
+def test_dense_layout_stays_localized_at_405x720() -> None:
+    layout = quantitative_analysis_module._build_dense_layout(Resolution(405, 720))
+
+    assert len(layout.row_starts) >= 12
+    assert len(layout.column_starts) >= 7
+    assert layout.tile_size <= 96
+
+
+def test_choose_quantitative_analysis_resolution_uses_richer_source_detail_when_bounded() -> None:
+    chosen = quantitative_analysis_module.choose_quantitative_analysis_resolution(
+        source_resolution=Resolution(608, 1080),
+        processing_resolution=Resolution(405, 720),
+    )
+
+    assert chosen == Resolution(608, 1080)
+
+
+def test_choose_quantitative_analysis_resolution_caps_large_source_but_stays_above_processing() -> None:
+    chosen = quantitative_analysis_module.choose_quantitative_analysis_resolution(
+        source_resolution=Resolution(1920, 1080),
+        processing_resolution=Resolution(640, 360),
+    )
+
+    assert chosen.width >= 640
+    assert chosen.height >= 360
+    assert (chosen.width * chosen.height) <= 700_000
+    assert chosen.width % 2 == 0
+    assert chosen.height % 2 == 0
+
+
+def test_quantitative_analysis_scales_exclusion_zones_into_analysis_resolution() -> None:
+    analyzer = StreamingQuantitativeAnalyzer(
+        settings=AnalysisSettings(export_advanced_files=False),
+        processing_resolution=Resolution(50, 50),
+        source_resolution=Resolution(100, 100),
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=4.0,
+        reference_luma=np.zeros((50, 50), dtype=np.float32),
+        exclusion_zones=(
+            ExclusionZone(
+                zone_id="exclude-bottom",
+                shape=ZoneShape.RECTANGLE,
+                mode=ZoneMode.EXCLUDE,
+                x=0.0,
+                y=50.0,
+                width=100.0,
+                height=50.0,
+            ),
+        ),
+        drift_assessment=DriftAssessment(),
+    )
+
+    lower_cells = [cell for cell in analyzer._base_cells if cell.center_y >= 37.5]
+    upper_cells = [cell for cell in analyzer._base_cells if cell.center_y <= 12.5]
+
+    assert lower_cells
+    assert upper_cells
+    assert all(cell.usable_fraction == 0.0 for cell in lower_cells)
+    assert all(cell.usable_fraction > 0.0 for cell in upper_cells)
+
+
+def test_quantitative_analysis_finalize_passes_roi_cell_records_into_band_resolution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    frames = _synthetic_motion_frames()
+    reference_luma = frames.mean(axis=0, dtype=np.float32)[..., 1]
+    analyzer = StreamingQuantitativeAnalyzer(
+        settings=AnalysisSettings(export_advanced_files=False),
+        processing_resolution=Resolution(32, 32),
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=4.0,
+        reference_luma=reference_luma,
+        exclusion_zones=(),
+        drift_assessment=DriftAssessment(),
+    )
+    captured: dict[str, int] = {}
+    original_resolve_bands = quantitative_analysis_module._resolve_bands
+
+    def spy_resolve_bands(*, roi_cell_records=(), **kwargs):
+        captured["roi_cell_count"] = len(roi_cell_records)
+        return original_resolve_bands(roi_cell_records=roi_cell_records, **kwargs)
+
+    monkeypatch.setattr(quantitative_analysis_module, "_resolve_bands", spy_resolve_bands)
+    analyzer.add_chunk(frames[:8])
+    analyzer.add_chunk(frames[8:])
+    analyzer.finalize(tmp_path)
+
+    assert captured["roi_cell_count"] > 0
 
 
 def test_resolve_bands_clamps_out_of_range_auto_peaks_to_requested_window() -> None:

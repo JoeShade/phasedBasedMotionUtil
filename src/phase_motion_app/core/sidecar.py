@@ -304,6 +304,12 @@ SIDECAR_SCHEMA_V1: dict[str, Any] = {
                                 {"$ref": "#/$defs/exclusion_zone"},
                             ]
                         },
+                        "analysis_resolution": {
+                            "anyOf": [
+                                {"type": "null"},
+                                {"$ref": "#/$defs/resolution"},
+                            ]
+                        },
                         "roi_quality_score": {"type": "number", "minimum": 0, "maximum": 1},
                         "confidence_label": {"type": "string", "minLength": 1},
                         "reported_peaks": {

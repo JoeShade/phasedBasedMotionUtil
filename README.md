@@ -29,7 +29,7 @@ python -m pip install -e .
 phase-motion-app
 ```
 
-Persisted convenience state is stored under `~/.phase_motion_app/` by default. Final MP4 and sidecar files are still written to the selected output folder.
+Persisted convenience state is stored under `~/.phase_motion_app/` by default. When you run from a source checkout, repo-local temp workspaces now stay under `./temp/` and diagnostics stay under `./diagnostics/`. Final MP4 and sidecar files are still written to the selected output folder.
 
 Resource-policy presets now affect actual worker execution behavior:
 - `Conservative`: smallest chunk caps and shallowest queues

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from phase_motion_app.core.models import DiagnosticLevel, JobIntent
@@ -105,12 +105,29 @@ def default_preferences(base_root: Path | None = None) -> GlobalPreferences:
 
     root = base_root or (Path.home() / ".phase_motion_app")
     return GlobalPreferences(
-        temp_root=str(root / "scratch"),
+        temp_root=str(root / "temp"),
         diagnostics_root=str(root / "diagnostics"),
         diagnostic_level=DiagnosticLevel.BASIC,
         diagnostics_cap_mb=1024,
         retention_budget_gb=50,
     )
+
+
+def migrate_legacy_temp_root(
+    preferences: GlobalPreferences,
+    runtime_root: Path,
+) -> GlobalPreferences:
+    """Move legacy repo-local scratch roots onto the dedicated temp root without touching custom overrides."""
+
+    desired_temp_root = runtime_root / "temp"
+    legacy_temp_roots = {
+        runtime_root / "scratch",
+        Path.home() / ".phase_motion_app" / "scratch",
+    }
+    current_temp_root = Path(preferences.temp_root)
+    if current_temp_root not in legacy_temp_roots:
+        return preferences
+    return replace(preferences, temp_root=str(desired_temp_root))
 
 
 def load_app_state(path: Path) -> PersistedAppState | None:

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -100,6 +103,7 @@ from phase_motion_app.core.settings_store import (
     PersistedAppState,
     default_preferences,
     load_app_state,
+    migrate_legacy_temp_root,
     save_app_state,
 )
 from phase_motion_app.core.watchdog import WatchdogThresholds
@@ -113,6 +117,16 @@ def _detect_checkout_root() -> Path | None:
     if (candidate / "pyproject.toml").exists():
         return candidate
     return None
+
+
+def _configure_process_temp_root(temp_root: Path) -> None:
+    """Keep generic temp-file APIs under the repo/runtime temp root so the app does not spill onto the system drive."""
+
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_root_text = str(temp_root)
+    tempfile.tempdir = temp_root_text
+    for variable_name in ("TMP", "TEMP", "TMPDIR"):
+        os.environ[variable_name] = temp_root_text
 
 
 def _timestamped_render_directory(
@@ -542,11 +556,13 @@ class MainWindow(QMainWindow):
         self._runtime_root = state_path.parent if state_path is not None else default_runtime_root
         self._state_path = state_path or (self._state_root / "settings.json")
         self._preferences = default_preferences(self._runtime_root)
+        _configure_process_temp_root(Path(self._preferences.temp_root))
         self._default_input_directory = self._runtime_root / "input"
         self._default_output_directory = self._runtime_root / "output"
         for directory in (
             self._default_input_directory,
             self._default_output_directory,
+            Path(self._preferences.temp_root),
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self._current_source_path: Path | None = None
@@ -570,9 +586,15 @@ class MainWindow(QMainWindow):
         self._active_render_request: RenderRequest | None = None
         self._last_terminal_snapshot: RenderSupervisorSnapshot | None = None
         self._render_started_at: float | None = None
-        self._last_progress_frame_count: int | None = None
+        self._progress_metric_stage: str | None = None
+        self._progress_metric_total_frames: int | None = None
+        self._progress_metric_started_at: float | None = None
+        self._last_progress_frame_count: float | None = None
         self._last_progress_at: float | None = None
         self._mean_seconds_per_frame: float | None = None
+        self._phase_virtual_frames_completed: float | None = None
+        self._phase_last_decode_counter: int | None = None
+        self._phase_nominal_chunk_frame_count: int | None = None
         self._heartbeat_flash_until: float | None = None
         self._resolution_presets = (
             Resolution(1920, 1080),
@@ -832,6 +854,10 @@ class MainWindow(QMainWindow):
         self.render_stage_label = QLabel("Idle")
         self.render_progress_label = QLabel("No active render.")
         self.elapsed_label = QLabel("-")
+        self.eta_label = QLabel("-")
+        self.eta_label.setToolTip(
+            "ETA is estimated in the GUI from the current stage's recent frame rate."
+        )
         self.mean_frame_label = QLabel("-")
         self.terminal_status_label = QLabel("No run yet.")
         self.terminal_status_label.setWordWrap(True)
@@ -842,6 +868,7 @@ class MainWindow(QMainWindow):
         status_layout.addRow("Current stage", self.render_stage_label)
         status_layout.addRow("Render progress", self.render_progress_label)
         status_layout.addRow("Elapsed", self.elapsed_label)
+        status_layout.addRow("ETA", self.eta_label)
         status_layout.addRow("Mean time / frame", self.mean_frame_label)
         status_layout.addRow("Latest outcome", self.terminal_status_label)
 
@@ -1935,13 +1962,18 @@ class MainWindow(QMainWindow):
         self._active_render_request = request
         self._last_terminal_snapshot = None
         self._render_started_at = time.monotonic()
+        self._progress_metric_stage = None
+        self._progress_metric_total_frames = None
+        self._progress_metric_started_at = None
         self._last_progress_frame_count = None
         self._last_progress_at = None
         self._mean_seconds_per_frame = None
+        self._reset_phase_processing_eta_state()
         self._heartbeat_flash_until = None
         self.render_stage_label.setText("Starting worker...")
         self.render_progress_label.setText("Waiting for handshake...")
         self.elapsed_label.setText("0.0 s")
+        self.eta_label.setText("Estimating...")
         self.mean_frame_label.setText("-")
         self.terminal_status_label.setText("Run in progress.")
 
@@ -1952,13 +1984,18 @@ class MainWindow(QMainWindow):
             self._render_supervisor = None
             self._active_render_request = None
             self._render_started_at = None
+            self._progress_metric_stage = None
+            self._progress_metric_total_frames = None
+            self._progress_metric_started_at = None
             self._last_progress_frame_count = None
             self._last_progress_at = None
             self._mean_seconds_per_frame = None
+            self._reset_phase_processing_eta_state()
             self._heartbeat_flash_until = None
             self.render_stage_label.setText("Idle")
             self.render_progress_label.setText("No active render.")
             self.elapsed_label.setText("-")
+            self.eta_label.setText("-")
             self.mean_frame_label.setText("-")
             self.terminal_status_label.setText("No run yet.")
             try:
@@ -2010,7 +2047,15 @@ class MainWindow(QMainWindow):
         self.render_stage_label.setText("Idle")
         self.render_progress_label.setText("No active render.")
         self.elapsed_label.setText("-")
+        self.eta_label.setText("-")
         self.mean_frame_label.setText("-")
+        self._progress_metric_stage = None
+        self._progress_metric_total_frames = None
+        self._progress_metric_started_at = None
+        self._last_progress_frame_count = None
+        self._last_progress_at = None
+        self._mean_seconds_per_frame = None
+        self._reset_phase_processing_eta_state()
         self._heartbeat_flash_until = None
         self._append_log(
             "Terminal run state cleared. The current source and settings remain loaded for a new attempt."
@@ -2026,6 +2071,7 @@ class MainWindow(QMainWindow):
             if event.message_type == "heartbeat":
                 self._note_heartbeat(event.received_at)
                 continue
+            self._consume_render_event_for_metrics(event)
             message = self._format_render_event(event)
             if message:
                 self._append_log(message)
@@ -2051,39 +2097,266 @@ class MainWindow(QMainWindow):
         if self._render_started_at is not None:
             self.elapsed_label.setText(f"{now - self._render_started_at:.1f} s")
 
-        if snapshot.frames_completed is None:
+        if snapshot.phase in {"starting", "preflight"}:
+            self.eta_label.setText("Estimating...")
+            return
+        if snapshot.phase != "rendering":
+            self.eta_label.setText("-")
+            return
+
+        current_stage = snapshot.stage or "render"
+        current_total_frames = snapshot.total_frames
+        progress_frames_completed = self._effective_progress_frame_count(snapshot)
+        if (
+            current_stage != self._progress_metric_stage
+            or current_total_frames != self._progress_metric_total_frames
+        ):
+            # The worker reports stage-local counters. Reset the shell-side rate
+            # estimate whenever the stage changes so decode timing does not leak
+            # into phase-processing or encode ETA text.
+            self._progress_metric_stage = current_stage
+            self._progress_metric_total_frames = current_total_frames
+            self._progress_metric_started_at = now
+            self._last_progress_frame_count = progress_frames_completed
+            self._last_progress_at = (
+                now if progress_frames_completed is not None else None
+            )
+            self._mean_seconds_per_frame = None
+            self.mean_frame_label.setText("-")
+            self._refresh_eta_label(snapshot)
+            return
+
+        if progress_frames_completed is None:
+            self._refresh_eta_label(snapshot)
             return
         if self._last_progress_frame_count is None:
-            self._last_progress_frame_count = snapshot.frames_completed
+            self._last_progress_frame_count = progress_frames_completed
             self._last_progress_at = now
+            self._refresh_eta_label(snapshot)
             return
-        if snapshot.frames_completed < self._last_progress_frame_count:
+        if progress_frames_completed < self._last_progress_frame_count:
             # Stage-local frame counters can reset when decode hands off to
             # phase processing or later stages. Treat that as a fresh baseline
             # instead of pinning the UI to the previous stage's terminal count.
-            self._last_progress_frame_count = snapshot.frames_completed
+            self._last_progress_frame_count = progress_frames_completed
             self._last_progress_at = now
+            self._progress_metric_started_at = now
             self._mean_seconds_per_frame = None
             self.mean_frame_label.setText("-")
+            self._refresh_eta_label(snapshot)
             return
         if (
-            snapshot.frames_completed <= self._last_progress_frame_count
+            progress_frames_completed <= self._last_progress_frame_count
             or self._last_progress_at is None
         ):
+            self._refresh_eta_label(snapshot)
             return
 
-        delta_frames = snapshot.frames_completed - self._last_progress_frame_count
-        delta_seconds = max(now - self._last_progress_at, 1e-6)
-        seconds_per_frame = delta_seconds / delta_frames
+        if (
+            current_stage == "phase_processing"
+            and self._progress_metric_started_at is not None
+            and progress_frames_completed > 0
+        ):
+            # Phase-processing emits many token-only sub-step updates before the
+            # next encode batch lands. Using a stage-average rate there is much
+            # steadier than re-timing every token-to-token jump.
+            seconds_per_frame = max(
+                now - self._progress_metric_started_at,
+                1e-6,
+            ) / progress_frames_completed
+        else:
+            delta_frames = progress_frames_completed - self._last_progress_frame_count
+            delta_seconds = max(now - self._last_progress_at, 1e-6)
+            seconds_per_frame = delta_seconds / delta_frames
         if self._mean_seconds_per_frame is None:
             self._mean_seconds_per_frame = seconds_per_frame
         else:
+            smoothing = 0.85 if current_stage == "phase_processing" else 0.7
             self._mean_seconds_per_frame = (
-                self._mean_seconds_per_frame * 0.7 + seconds_per_frame * 0.3
+                self._mean_seconds_per_frame * smoothing
+                + seconds_per_frame * (1.0 - smoothing)
             )
-        self._last_progress_frame_count = snapshot.frames_completed
+        self._last_progress_frame_count = progress_frames_completed
         self._last_progress_at = now
         self.mean_frame_label.setText(f"{self._mean_seconds_per_frame:.3f} s")
+        self._refresh_eta_label(snapshot)
+
+    def _refresh_eta_label(self, snapshot: RenderSupervisorSnapshot) -> None:
+        """Update the GUI-only ETA from the current stage's recent frame rate without asking the worker for extra state."""
+
+        if snapshot.phase != "rendering":
+            self.eta_label.setText("-")
+            return
+        progress_frames_completed = self._effective_progress_frame_count(snapshot)
+        if progress_frames_completed is None or snapshot.total_frames is None:
+            self.eta_label.setText("Estimating...")
+            return
+        if progress_frames_completed >= snapshot.total_frames:
+            self.eta_label.setText("0.0 s")
+            return
+        if self._mean_seconds_per_frame is None or progress_frames_completed <= 0:
+            self.eta_label.setText("Estimating...")
+            return
+        remaining_frames = max(snapshot.total_frames - progress_frames_completed, 0.0)
+        eta_seconds = remaining_frames * self._mean_seconds_per_frame
+        self.eta_label.setText(self._format_eta_seconds(eta_seconds))
+
+    def _effective_progress_frame_count(
+        self,
+        snapshot: RenderSupervisorSnapshot,
+    ) -> float | None:
+        """Return the shell-side best estimate of completed frames for ETA purposes, including phase-stage sub-step progress."""
+
+        completed = (
+            None
+            if snapshot.frames_completed is None
+            else float(snapshot.frames_completed)
+        )
+        if snapshot.phase != "rendering" or snapshot.stage != "phase_processing":
+            return completed
+        if self._phase_virtual_frames_completed is None:
+            return completed
+        if completed is None:
+            return self._phase_virtual_frames_completed
+        return max(completed, self._phase_virtual_frames_completed)
+
+    def _consume_render_event_for_metrics(self, event: RenderEvent) -> None:
+        """Fold shell-visible progress traffic into ETA state so the GUI can react to worker sub-stage motion without changing the IPC contract."""
+
+        if event.message_type == "stage_started":
+            self._reset_phase_processing_eta_state()
+            return
+        if event.message_type != "progress_update":
+            return
+        payload = event.payload
+        if str(payload.get("stage") or "") != "phase_processing":
+            return
+
+        decode_counter = payload.get("decode_frames_completed")
+        if isinstance(decode_counter, int):
+            if (
+                self._phase_last_decode_counter is None
+                or decode_counter < self._phase_last_decode_counter
+            ):
+                self._phase_nominal_chunk_frame_count = decode_counter
+            else:
+                chunk_frame_count = decode_counter - self._phase_last_decode_counter
+                if chunk_frame_count > 0:
+                    self._phase_nominal_chunk_frame_count = chunk_frame_count
+            self._phase_last_decode_counter = decode_counter
+
+        frames_completed = payload.get("frames_completed")
+        if isinstance(frames_completed, int):
+            actual_completed = float(frames_completed)
+            if self._phase_virtual_frames_completed is None:
+                self._phase_virtual_frames_completed = actual_completed
+            else:
+                self._phase_virtual_frames_completed = max(
+                    self._phase_virtual_frames_completed,
+                    actual_completed,
+                )
+            return
+
+        detail = payload.get("detail")
+        if not isinstance(detail, str):
+            return
+        chunk_progress_fraction = self._phase_processing_detail_fraction(detail)
+        if chunk_progress_fraction is None:
+            return
+        progress_token = payload.get("progress_token")
+        encoded_baseline = self._phase_processing_encoded_baseline(progress_token)
+        if encoded_baseline is None or self._phase_nominal_chunk_frame_count is None:
+            return
+        candidate_progress = float(
+            encoded_baseline
+            + (self._phase_nominal_chunk_frame_count * chunk_progress_fraction)
+        )
+        if self._phase_virtual_frames_completed is None:
+            self._phase_virtual_frames_completed = candidate_progress
+            return
+        self._phase_virtual_frames_completed = max(
+            self._phase_virtual_frames_completed,
+            candidate_progress,
+        )
+
+    def _phase_processing_encoded_baseline(
+        self,
+        progress_token: object,
+    ) -> int | None:
+        """Extract the last fully encoded frame count from the phase-processing token so token-only updates can still advance the ETA model."""
+
+        if not isinstance(progress_token, str):
+            return None
+        token_parts = progress_token.split(":")
+        if len(token_parts) != 3 or token_parts[0] != "phase_processing":
+            return None
+        try:
+            return int(token_parts[1])
+        except ValueError:
+            return None
+
+    def _phase_processing_detail_fraction(self, detail: str) -> float | None:
+        """Map one phase-engine progress string onto an approximate chunk fraction so the GUI ETA moves during compute-heavy work instead of waiting for encode-only counters."""
+
+        motion_weight = 0.34
+        temporal_weight = 0.16
+        warp_weight = 0.34
+
+        if detail == "motion_grid_done":
+            return motion_weight
+        if detail == "x_temporal_band_done":
+            return motion_weight + temporal_weight
+        if detail == "y_temporal_band_done":
+            return motion_weight + (temporal_weight * 2.0)
+        if detail == "warp_done":
+            return 1.0
+
+        fraction = self._progress_detail_fraction(detail)
+        if fraction is None:
+            return None
+
+        if detail.startswith("motion_grid_tile_") or detail.startswith(
+            "motion_grid_partition_"
+        ):
+            return motion_weight * fraction
+        if detail.startswith("x_temporal_band_"):
+            return motion_weight + (temporal_weight * fraction)
+        if detail.startswith("y_temporal_band_"):
+            return motion_weight + temporal_weight + (temporal_weight * fraction)
+        if detail.startswith("warp_"):
+            return motion_weight + (temporal_weight * 2.0) + (warp_weight * fraction)
+        return None
+
+    def _progress_detail_fraction(self, detail: str) -> float | None:
+        """Parse one `_X_of_Y` progress detail into a stable fraction."""
+
+        match = re.search(r"_(\d+)_of_(\d+)$", detail)
+        if match is None:
+            return None
+        total = int(match.group(2))
+        if total <= 0:
+            return None
+        completed = int(match.group(1))
+        return float(max(0.0, min(completed / total, 1.0)))
+
+    def _reset_phase_processing_eta_state(self) -> None:
+        """Clear chunk-local phase ETA state when a new render starts or the worker leaves phase processing."""
+
+        self._phase_virtual_frames_completed = None
+        self._phase_last_decode_counter = None
+        self._phase_nominal_chunk_frame_count = None
+
+    def _format_eta_seconds(self, seconds: float) -> str:
+        """Render ETA text compactly so longer runs do not leave the shell showing a wall of seconds."""
+
+        if seconds < 60.0:
+            return f"{seconds:.1f} s"
+        total_seconds = max(0, int(round(seconds)))
+        minutes, second_value = divmod(total_seconds, 60)
+        if minutes < 60:
+            return f"{minutes:d}m {second_value:02d}s"
+        hours, minute_value = divmod(minutes, 60)
+        return f"{hours:d}h {minute_value:02d}m {second_value:02d}s"
 
     def _apply_render_state(self, snapshot: RenderSupervisorSnapshot) -> None:
         if (
@@ -2370,7 +2643,8 @@ class MainWindow(QMainWindow):
         if state is None:
             return
 
-        self._preferences = state.preferences
+        self._preferences = migrate_legacy_temp_root(state.preferences, self._runtime_root)
+        _configure_process_temp_root(Path(self._preferences.temp_root))
         self.diagnostic_level_combo.setCurrentText(
             self._preferences.diagnostic_level.value.title()
         )

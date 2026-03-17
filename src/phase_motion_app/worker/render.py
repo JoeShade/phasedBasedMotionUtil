@@ -49,6 +49,7 @@ from phase_motion_app.core.quantitative_analysis import (
     StreamingQuantitativeAnalyzer,
     build_disabled_analysis_export,
     build_empty_analysis_export,
+    choose_quantitative_analysis_resolution,
 )
 from phase_motion_app.core.preflight import (
     PreflightSeverity,
@@ -558,9 +559,20 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             "Scanning the working clip to build the global phase reference.",
             {"chunk_frames": scheduler.chunk_frames},
         )
+        analysis_resolution = request.intent.processing_resolution
+        if request.intent.analysis.enabled:
+            analysis_resolution = choose_quantitative_analysis_resolution(
+                source_resolution=source_resolution,
+                processing_resolution=request.intent.processing_resolution,
+            )
+        reference_decode_resolution = (
+            request.intent.processing_resolution
+            if analysis_resolution == request.intent.processing_resolution
+            else source_resolution
+        )
         reference_decoder = RawvideoDecodeProcess(
             source_path=working_source_path,
-            output_resolution=request.intent.processing_resolution,
+            output_resolution=reference_decode_resolution,
             normalization_plan=working_plan,
         )
         reference_exit_code: int | None = None
@@ -568,6 +580,13 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             (
                 request.intent.processing_resolution.height,
                 request.intent.processing_resolution.width,
+            ),
+            dtype=np.float64,
+        )
+        analysis_reference_luma_sum = np.zeros(
+            (
+                analysis_resolution.height,
+                analysis_resolution.width,
             ),
             dtype=np.float64,
         )
@@ -581,12 +600,34 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                 chunk = reference_decoder.read_chunk_bytes(scheduler.chunk_frames)
                 if not chunk:
                     break
-                processing_chunk = _bytes_to_float_frames(
+                reference_chunk = _bytes_to_float_frames(
                     chunk,
-                    width=request.intent.processing_resolution.width,
-                    height=request.intent.processing_resolution.height,
+                    width=reference_decode_resolution.width,
+                    height=reference_decode_resolution.height,
                 )
+                if reference_decode_resolution == request.intent.processing_resolution:
+                    processing_chunk = reference_chunk
+                else:
+                    processing_chunk = resize_rgb_frames_bilinear(
+                        reference_chunk,
+                        request.intent.processing_resolution,
+                    )
                 reference_luma_sum += _frames_to_luma(processing_chunk).sum(
+                    axis=0,
+                    dtype=np.float64,
+                )
+                if analysis_resolution == request.intent.processing_resolution:
+                    analysis_reference_chunk = processing_chunk
+                elif analysis_resolution == reference_decode_resolution:
+                    analysis_reference_chunk = reference_chunk
+                else:
+                    analysis_reference_chunk = resize_rgb_frames_bilinear(
+                        reference_chunk,
+                        analysis_resolution,
+                    )
+                analysis_reference_luma_sum += _frames_to_luma(
+                    analysis_reference_chunk
+                ).sum(
                     axis=0,
                     dtype=np.float64,
                 )
@@ -602,6 +643,10 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                     },
                 )
                 del processing_chunk
+                if analysis_resolution != request.intent.processing_resolution:
+                    del analysis_reference_chunk
+                if reference_decode_resolution != request.intent.processing_resolution:
+                    del reference_chunk
             reference_exit_code = reference_decoder.close()
         finally:
             if reference_exit_code is None:
@@ -612,6 +657,9 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
 
         reference_luma = (
             reference_luma_sum / max(reference_frame_count, 1)
+        ).astype(np.float32, copy=False)
+        analysis_reference_luma = (
+            analysis_reference_luma_sum / max(reference_frame_count, 1)
         ).astype(np.float32, copy=False)
 
         codec_plan = _choose_codec_plan()
@@ -642,13 +690,14 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             try:
                 analysis_analyzer = StreamingQuantitativeAnalyzer(
                     settings=request.intent.analysis,
-                    processing_resolution=request.intent.processing_resolution,
+                    processing_resolution=analysis_resolution,
                     fps=working_plan.working_fps,
                     low_hz=request.intent.phase.low_hz,
                     high_hz=request.intent.phase.high_hz,
-                    reference_luma=reference_luma,
+                    reference_luma=analysis_reference_luma,
                     exclusion_zones=request.intent.exclusion_zones,
                     drift_assessment=request.drift_assessment,
+                    source_resolution=source_resolution,
                 )
                 if scheduler.analyzer_mode.value == "background_thread":
                     # The helper thread gets a bounded queue so analysis can lag
@@ -853,7 +902,16 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                     )
                     if analysis_analyzer is not None:
                         try:
-                            analysis_analyzer.add_chunk(processing_chunk)
+                            if analysis_resolution == request.intent.processing_resolution:
+                                analysis_chunk = processing_chunk
+                            elif analysis_resolution == source_resolution:
+                                analysis_chunk = source_chunk
+                            else:
+                                analysis_chunk = resize_rgb_frames_bilinear(
+                                    source_chunk,
+                                    analysis_resolution,
+                                )
+                            analysis_analyzer.add_chunk(analysis_chunk)
                         except Exception as exc:
                             analysis_collection_warning = (
                                 "Quantitative analysis collection failed during phase processing "

@@ -12,6 +12,7 @@ from phase_motion_app.core.settings_store import (
     LastUsedSettings,
     default_preferences,
     load_app_state,
+    migrate_legacy_temp_root,
     save_app_state,
 )
 
@@ -74,5 +75,21 @@ def test_settings_store_rejects_unsupported_version(tmp_path: Path) -> None:
 def test_default_preferences_build_portable_friendly_roots(tmp_path: Path) -> None:
     preferences = default_preferences(tmp_path / "portable")
 
-    assert preferences.temp_root.endswith("scratch")
+    assert preferences.temp_root.endswith("temp")
     assert preferences.diagnostics_root.endswith("diagnostics")
+
+
+def test_migrate_legacy_temp_root_rehomes_runtime_scratch(tmp_path: Path) -> None:
+    legacy_preferences = default_preferences(tmp_path)
+    legacy_preferences = legacy_preferences.__class__(
+        temp_root=str(tmp_path / "scratch"),
+        diagnostics_root=legacy_preferences.diagnostics_root,
+        diagnostic_level=legacy_preferences.diagnostic_level,
+        diagnostics_cap_mb=legacy_preferences.diagnostics_cap_mb,
+        retention_budget_gb=legacy_preferences.retention_budget_gb,
+    )
+
+    migrated = migrate_legacy_temp_root(legacy_preferences, tmp_path)
+
+    assert migrated.temp_root == str(tmp_path / "temp")
+    assert migrated.diagnostics_root == legacy_preferences.diagnostics_root
