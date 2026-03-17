@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import hashlib
-import gc
 import json
 import os
 import platform
@@ -14,6 +12,7 @@ import subprocess
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from multiprocessing.synchronize import Event as EventType
 from pathlib import Path
@@ -102,75 +101,76 @@ class _SharedSequence:
             return self._value
 
 
-class _DecodeAheadBuffer:
-    """PERF: Bounded queue for decode-ahead buffering.
-    
-    Decouples FFmpeg decode I/O from frame processing. Decode thread fills queue
-    while main thread processes, enabling 20-35% throughput gain by overlapping
-    I/O with CPU work. Bounded size prevents unbounded memory growth.
-    """
+@dataclass(frozen=True)
+class _DecodedChunk:
+    """This model carries one bounded decoded batch from the ffmpeg reader thread into the numeric worker thread."""
 
-    def __init__(self, max_size: int = 3) -> None:
-        """Initialize with max number of chunks to buffer (3-5 recommended)."""
-        self._queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue(maxsize=max_size)
-        self._seq = 0
-        self._lock = threading.Lock()
-
-    def put_chunk(self, chunk_bytes: bytes, timeout: float = 30.0) -> None:
-        """Put decoded chunk into buffer. None signals EOF."""
-        with self._lock:
-            seq = self._seq
-            self._seq += 1
-        try:
-            self._queue.put((seq, chunk_bytes), block=True, timeout=timeout)
-        except queue.Full:
-            raise TimeoutError("Decode-ahead buffer full after timeout")
-
-    def put_eof(self) -> None:
-        """Signal end-of-stream."""
-        try:
-            self._queue.put(None, block=True, timeout=5.0)
-        except Exception:
-            pass  # Best effort
-
-    def get_chunk(self, timeout: float = 10.0) -> bytes | None:
-        """Get next chunk (None = EOF). Raises TimeoutError if timeout."""
-        try:
-            result = self._queue.get(block=True, timeout=timeout)
-            if result is None:
-                return None  # EOF marker
-            seq, chunk_bytes = result
-            return chunk_bytes
-        except queue.Empty:
-            raise TimeoutError("Decode-ahead buffer empty after timeout")
+    chunk_index: int
+    frame_count: int
+    frame_bytes: bytearray
+    decode_counter: int
 
 
-def _decode_ahead_worker(
-    decoder: RawvideoDecodeProcess,
-    buffer: _DecodeAheadBuffer,
+@dataclass(frozen=True)
+class _EncodedChunk:
+    """This model carries one bounded encoded-input batch from the numeric worker thread into the ffmpeg writer thread."""
+
+    chunk_index: int
+    frame_count: int
+    frame_bytes: bytes
+    decode_counter: int
+
+
+@dataclass(frozen=True)
+class _PipelineFailure:
+    """This model keeps cross-thread failures structured so the main worker thread can emit one authoritative terminal message."""
+
+    classification: str
+    stage: str
+    detail: str | None = None
+    exception_type: str | None = None
+
+
+_PIPELINE_SENTINEL = object()
+_PIPELINE_QUEUE_DEPTH = 1
+
+
+def _queue_put_with_cancel(
+    work_queue: queue.Queue,
+    item: object,
+    *,
     cancel_event: EventType,
-    chunk_frames: int,
-) -> None:
-    """Background thread that pre-decodes frames into buffer.
-    
-    PERF: Runs parallel to main processing, enabling decode-ahead buffering.
-    Gracefully handles cancellation and subprocess errors.
-    """
-    try:
-        while not cancel_event.is_set():
-            chunk = decoder.read_frames(chunk_frames)
-            if not chunk:
-                buffer.put_eof()
-                break
-            try:
-                buffer.put_chunk(chunk, timeout=10.0)
-            except TimeoutError:
-                # Buffer full; wait for cancellation
-                if cancel_event.wait(timeout=0.5):
-                    break
-    except Exception:
-        # On error, signal EOF to unblock main thread
-        buffer.put_eof()
+    stop_event: threading.Event,
+    timeout_seconds: float = 0.05,
+) -> bool:
+    """Try to enqueue bounded work without letting a stalled downstream stage block cancellation forever."""
+
+    while True:
+        if cancel_event.is_set() or stop_event.is_set():
+            return False
+        try:
+            work_queue.put(item, timeout=timeout_seconds)
+            return True
+        except queue.Full:
+            continue
+
+
+def _queue_get_with_cancel(
+    work_queue: queue.Queue,
+    *,
+    cancel_event: EventType,
+    stop_event: threading.Event,
+    timeout_seconds: float = 0.05,
+) -> object:
+    """Wait for bounded work while still giving cancellation and failure signals a fast exit path."""
+
+    while True:
+        if cancel_event.is_set() or stop_event.is_set():
+            return _PIPELINE_SENTINEL
+        try:
+            return work_queue.get(timeout=timeout_seconds)
+        except queue.Empty:
+            continue
 
 
 def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventType) -> None:
@@ -206,6 +206,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
 
     stop_heartbeat = threading.Event()
     sequence = _SharedSequence()
+    log_lock = threading.Lock()
     stage_timings: dict[str, float] = {}
     current_stage = "bootstrap"
     current_stage_started_at = time.monotonic()
@@ -245,14 +246,15 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
         )
 
     def log(level: str, event_type: str, stage: str, message: str, payload: dict | None = None) -> None:
-        logger.log(
-            level=level,
-            event_type=event_type,
-            job_id=request.job_id,
-            stage=stage,
-            message=message,
-            payload=payload,
-        )
+        with log_lock:
+            logger.log(
+                level=level,
+                event_type=event_type,
+                job_id=request.job_id,
+                stage=stage,
+                message=message,
+                payload=payload,
+            )
 
     def record_stage_transition(next_stage: str) -> None:
         nonlocal current_stage, current_stage_started_at
@@ -478,14 +480,12 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             normalization_plan=working_plan,
         )
         reference_exit_code: int | None = None
-        # PERF: Use float32 for reference accumulation instead of float64 to reduce memory pressure
-        # and avoid redundant conversion overhead. Reference_luma is never used in float64 precision.
         reference_luma_sum = np.zeros(
             (
                 request.intent.processing_resolution.height,
                 request.intent.processing_resolution.width,
             ),
-            dtype=np.float32,
+            dtype=np.float64,
         )
         reference_frame_count = 0
         try:
@@ -494,7 +494,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                     note_terminal("job_cancelled")
                     emit("job_cancelled", {})
                     raise SystemExit(0)
-                chunk = reference_decoder.read_frames(scheduler.chunk_frames)
+                chunk = reference_decoder.read_chunk_bytes(scheduler.chunk_frames)
                 if not chunk:
                     break
                 processing_chunk = _bytes_to_float_frames(
@@ -504,7 +504,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                 )
                 reference_luma_sum += _frames_to_luma(processing_chunk).sum(
                     axis=0,
-                    dtype=np.float32,
+                    dtype=np.float64,
                 )
                 reference_frame_count += processing_chunk.shape[0]
                 child_counter = reference_decoder.take_progress_counter() or reference_frame_count
@@ -526,8 +526,9 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             emit_failure("decode_failure", "decode")
             raise SystemExit(1)
 
-        # PERF: reference_luma_sum is already float32, no redundant conversion needed
-        reference_luma = reference_luma_sum / max(reference_frame_count, 1)
+        reference_luma = (
+            reference_luma_sum / max(reference_frame_count, 1)
+        ).astype(np.float32, copy=False)
 
         codec_plan = _choose_codec_plan()
         emit("warning", {"messages": list(codec_plan.warnings)})
@@ -601,178 +602,363 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             pixel_format=codec_plan.pixel_format,
             color_tags=codec_plan.color_tags or _default_color_tags(),
         )
-        
-        # PERF: Decode-ahead buffering decouples I/O from processing
-        # Background decode thread fills buffer while main thread processes,
-        # enabling 20-35% throughput gain by overlapping network I/O with CPU work.
-        decode_buffer = _DecodeAheadBuffer(max_size=3)
-        decode_thread = threading.Thread(
-            target=_decode_ahead_worker,
-            args=(decoder, decode_buffer, cancel_event, scheduler.chunk_frames),
-            daemon=False,
-        )
-        decode_thread.start()
-        
         decode_exit: int | None = None
         encoder_exit_code: int | None = None
         processed_frame_count = 0
         phase_progress_counter = 0
+        progress_stage_name = "phase_processing"
+        pipeline_stop = threading.Event()
+        pipeline_failure: _PipelineFailure | None = None
+        pipeline_failure_lock = threading.Lock()
+        progress_lock = threading.Lock()
+        decoded_queue: queue.Queue = queue.Queue(maxsize=_PIPELINE_QUEUE_DEPTH)
+        encoded_queue: queue.Queue = queue.Queue(maxsize=_PIPELINE_QUEUE_DEPTH)
+        source_frame_size = source_resolution.width * source_resolution.height * 3
+        output_frame_size = (
+            request.intent.output_resolution.width
+            * request.intent.output_resolution.height
+            * 3
+        )
+        mask_array_rgb = mask_array[None, :, :, None]
+        inverse_mask_array_rgb = np.float32(1.0) - mask_array_rgb
+
+        def set_pipeline_failure(
+            classification: str,
+            stage: str,
+            *,
+            detail: str | None = None,
+            exception_type: str | None = None,
+        ) -> None:
+            nonlocal pipeline_failure
+            with pipeline_failure_lock:
+                if pipeline_failure is None:
+                    pipeline_failure = _PipelineFailure(
+                        classification=classification,
+                        stage=stage,
+                        detail=detail,
+                        exception_type=exception_type,
+                    )
+            pipeline_stop.set()
+
+        def get_pipeline_failure() -> _PipelineFailure | None:
+            with pipeline_failure_lock:
+                return pipeline_failure
+
+        def raise_pipeline_failure_if_present() -> None:
+            failure = get_pipeline_failure()
+            if failure is None:
+                return
+            emit_failure(
+                failure.classification,
+                failure.stage,
+                detail=failure.detail,
+                exception_type=failure.exception_type,
+            )
+            raise SystemExit(1)
+
+        def report_phase_progress(detail: str) -> None:
+            nonlocal phase_progress_counter
+            with progress_lock:
+                phase_progress_counter += 1
+                encoded_snapshot = processed_frame_count
+            emit(
+                "progress_update",
+                {
+                    "progress_token": f"phase_processing:{encoded_snapshot}:{phase_progress_counter}",
+                    "stage": "phase_processing",
+                    "detail": detail,
+                },
+            )
+
+        def decode_loop() -> None:
+            nonlocal decode_exit
+            chunk_index = 0
+            decoded_frames_completed = 0
+            try:
+                while not cancel_event.is_set() and not pipeline_stop.is_set():
+                    chunk = decoder.read_chunk_bytes(scheduler.chunk_frames)
+                    if not chunk:
+                        break
+                    frame_count = len(chunk) // source_frame_size
+                    if frame_count <= 0:
+                        break
+                    chunk_index += 1
+                    decoded_frames_completed += frame_count
+                    decode_counter = decoder.take_progress_counter() or decoded_frames_completed
+                    # Keep only one queued chunk ahead of compute so decode can
+                    # overlap with numeric work without quietly cloning the clip
+                    # into RAM.
+                    if not _queue_put_with_cancel(
+                        decoded_queue,
+                        _DecodedChunk(
+                            chunk_index=chunk_index,
+                            frame_count=frame_count,
+                            frame_bytes=chunk,
+                            decode_counter=decode_counter,
+                        ),
+                        cancel_event=cancel_event,
+                        stop_event=pipeline_stop,
+                    ):
+                        return
+                    emit(
+                        "progress_update",
+                        {
+                            "progress_token": f"decode_chunk:{decode_counter}",
+                            "stage": "phase_processing",
+                            "detail": "decode_chunk_ready",
+                            "decode_frames_completed": decode_counter,
+                        },
+                    )
+                decode_exit = decoder.close()
+                if decode_exit != 0 and not cancel_event.is_set():
+                    set_pipeline_failure("decode_failure", "phase_processing")
+            except Exception as exc:
+                set_pipeline_failure(
+                    _classify_worker_exception(exc),
+                    "phase_processing",
+                    detail=_format_worker_exception_detail(exc),
+                    exception_type=type(exc).__name__,
+                )
+            finally:
+                if decode_exit is None:
+                    decode_exit = decoder.cancel()
+                if not pipeline_stop.is_set() and not cancel_event.is_set():
+                    _queue_put_with_cancel(
+                        decoded_queue,
+                        _PIPELINE_SENTINEL,
+                        cancel_event=cancel_event,
+                        stop_event=pipeline_stop,
+                    )
+
+        def compute_loop() -> None:
+            nonlocal analysis_analyzer, analysis_collection_warning
+            try:
+                while True:
+                    item = _queue_get_with_cancel(
+                        decoded_queue,
+                        cancel_event=cancel_event,
+                        stop_event=pipeline_stop,
+                    )
+                    if item is _PIPELINE_SENTINEL:
+                        break
+                    chunk = item
+                    assert isinstance(chunk, _DecodedChunk)
+                    source_chunk = _bytes_to_float_frames(
+                        chunk.frame_bytes,
+                        width=source_resolution.width,
+                        height=source_resolution.height,
+                    )
+                    processing_chunk = (
+                        source_chunk
+                        if source_resolution == request.intent.processing_resolution
+                        else resize_rgb_frames_bilinear(
+                            source_chunk,
+                            request.intent.processing_resolution,
+                        )
+                    )
+                    if analysis_analyzer is not None:
+                        try:
+                            analysis_analyzer.add_chunk(processing_chunk)
+                        except Exception as exc:
+                            analysis_collection_warning = (
+                                "Quantitative analysis collection failed during phase processing "
+                                f"and was disabled for the rest of the render: {exc}"
+                            )
+                            log(
+                                "warning",
+                                "analysis_collection_failed",
+                                "phase_processing",
+                                analysis_collection_warning,
+                            )
+                            emit("warning", {"messages": [analysis_collection_warning]})
+                            analysis_analyzer = None
+                    amplified_processing = phase_amplifier.process_chunk(
+                        processing_chunk,
+                        progress_callback=report_phase_progress,
+                    )
+                    amplified_output = (
+                        amplified_processing
+                        if request.intent.processing_resolution
+                        == request.intent.output_resolution
+                        else resize_rgb_frames_bilinear(
+                            amplified_processing,
+                            request.intent.output_resolution,
+                        )
+                    )
+                    passthrough_output = (
+                        source_chunk
+                        if source_resolution == request.intent.output_resolution
+                        else resize_rgb_frames_bilinear(
+                            source_chunk,
+                            request.intent.output_resolution,
+                        )
+                    )
+                    # Composite in place so the worker does not keep three full
+                    # output-domain copies of the same chunk around at once.
+                    np.multiply(
+                        amplified_output,
+                        inverse_mask_array_rgb,
+                        out=amplified_output,
+                    )
+                    np.multiply(
+                        passthrough_output,
+                        mask_array_rgb,
+                        out=passthrough_output,
+                    )
+                    amplified_output += passthrough_output
+                    if not _queue_put_with_cancel(
+                        encoded_queue,
+                        _EncodedChunk(
+                            chunk_index=chunk.chunk_index,
+                            frame_count=chunk.frame_count,
+                            frame_bytes=_float_frames_to_rgb24_bytes(amplified_output),
+                            decode_counter=chunk.decode_counter,
+                        ),
+                        cancel_event=cancel_event,
+                        stop_event=pipeline_stop,
+                    ):
+                        return
+            except Exception as exc:
+                set_pipeline_failure(
+                    _classify_worker_exception(exc),
+                    "phase_processing",
+                    detail=_format_worker_exception_detail(exc),
+                    exception_type=type(exc).__name__,
+                )
+            finally:
+                if not pipeline_stop.is_set() and not cancel_event.is_set():
+                    _queue_put_with_cancel(
+                        encoded_queue,
+                        _PIPELINE_SENTINEL,
+                        cancel_event=cancel_event,
+                        stop_event=pipeline_stop,
+                    )
+
+        def encode_loop() -> None:
+            nonlocal encoder_exit_code, processed_frame_count
+            try:
+                while True:
+                    item = _queue_get_with_cancel(
+                        encoded_queue,
+                        cancel_event=cancel_event,
+                        stop_event=pipeline_stop,
+                    )
+                    if item is _PIPELINE_SENTINEL:
+                        break
+                    chunk = item
+                    assert isinstance(chunk, _EncodedChunk)
+                    progress_emit_step = max(1, chunk.frame_count // 8)
+                    frames_written_for_chunk = 0
+                    while frames_written_for_chunk < chunk.frame_count:
+                        if cancel_event.is_set() or pipeline_stop.is_set():
+                            return
+                        frames_in_write = min(
+                            progress_emit_step,
+                            chunk.frame_count - frames_written_for_chunk,
+                        )
+                        byte_start = frames_written_for_chunk * output_frame_size
+                        byte_stop = byte_start + (frames_in_write * output_frame_size)
+                        encoder.write_frames(chunk.frame_bytes[byte_start:byte_stop])
+                        frames_written_for_chunk += frames_in_write
+                        with progress_lock:
+                            processed_frame_count += frames_in_write
+                            processed_snapshot = processed_frame_count
+                            stage_name = progress_stage_name
+                        encode_counter = encoder.take_progress_counter() or processed_snapshot
+                        emit(
+                            "progress_update",
+                            {
+                                "progress_token": f"batch:{processed_snapshot}",
+                                "stage": stage_name,
+                                "frames_completed": processed_snapshot,
+                                "total_frames": working_probe.frame_count,
+                                "decode_frames_completed": chunk.decode_counter,
+                                "encoded_frames_completed": encode_counter,
+                            },
+                        )
+                encoder_exit_code = encoder.finish()
+            except (BrokenPipeError, OSError) as exc:
+                encode_detail = _describe_encode_stream_failure(encoder, exc)
+                log(
+                    "error",
+                    "encode_stream_failure",
+                    "phase_processing",
+                    "The ffmpeg encoder stopped accepting frames during phase processing.",
+                    {"error": encode_detail},
+                )
+                set_pipeline_failure(
+                    "encode_failure",
+                    progress_stage_name,
+                    detail=encode_detail,
+                    exception_type=type(exc).__name__,
+                )
+            except Exception as exc:
+                set_pipeline_failure(
+                    _classify_worker_exception(exc),
+                    progress_stage_name,
+                    detail=_format_worker_exception_detail(exc),
+                    exception_type=type(exc).__name__,
+                )
+            finally:
+                if encoder_exit_code is None:
+                    encoder_exit_code = encoder.cancel()
+
+        decode_thread = threading.Thread(
+            target=decode_loop,
+            name="render-decode-reader",
+            daemon=True,
+        )
+        compute_thread = threading.Thread(
+            target=compute_loop,
+            name="render-compute-worker",
+            daemon=True,
+        )
+        encode_thread = threading.Thread(
+            target=encode_loop,
+            name="render-encode-writer",
+            daemon=True,
+        )
         try:
-            while True:
+            decode_thread.start()
+            compute_thread.start()
+            encode_thread.start()
+            while decode_thread.is_alive() or compute_thread.is_alive():
                 if cancel_event.is_set():
                     note_terminal("job_cancelled")
                     emit("job_cancelled", {})
                     raise SystemExit(0)
-                
-                # PERF: Get from decode-ahead buffer instead of blocking on subprocess
-                try:
-                    chunk = decode_buffer.get_chunk(timeout=10.0)
-                except TimeoutError:
-                    # Timeout waiting for buffered frames; check if cancelled
-                    if cancel_event.is_set():
-                        note_terminal("job_cancelled")
-                        emit("job_cancelled", {})
-                        raise SystemExit(0)
-                    # Otherwise retry
-                    continue
-                    
-                if not chunk:
-                    break
-                source_chunk = _bytes_to_float_frames(
-                    chunk,
-                    width=source_resolution.width,
-                    height=source_resolution.height,
-                )
-
-                def report_phase_progress(detail: str) -> None:
-                    nonlocal phase_progress_counter
-                    phase_progress_counter += 1
-                    emit(
-                        "progress_update",
-                        {
-                            "progress_token": f"phase_processing:{processed_frame_count}:{phase_progress_counter}",
-                            "stage": "phase_processing",
-                            "detail": detail,
-                        },
-                    )
-
-                processing_chunk = resize_rgb_frames_bilinear(
-                    source_chunk,
-                    request.intent.processing_resolution,
-                )
-                if analysis_analyzer is not None:
-                    try:
-                        analysis_analyzer.add_chunk(processing_chunk)
-                    except Exception as exc:
-                        analysis_collection_warning = (
-                            "Quantitative analysis collection failed during phase processing "
-                            f"and was disabled for the rest of the render: {exc}"
-                        )
-                        log(
-                            "warning",
-                            "analysis_collection_failed",
-                            "phase_processing",
-                            analysis_collection_warning,
-                        )
-                        emit("warning", {"messages": [analysis_collection_warning]})
-                        analysis_analyzer = None
-                amplified_processing = phase_amplifier.process_chunk(
-                    processing_chunk,
-                    progress_callback=report_phase_progress,
-                )
-                amplified_output = resize_rgb_frames_bilinear(
-                    amplified_processing,
-                    request.intent.output_resolution,
-                )
-                passthrough_output = resize_rgb_frames_bilinear(
-                    source_chunk,
-                    request.intent.output_resolution,
-                )
-                composed_output = passthrough_output * mask_array[None, :, :, None] + (
-                    amplified_output * (1.0 - mask_array[None, :, :, None])
-                )
-                chunk_frame_count = source_chunk.shape[0]
-                chunk_start_frame_count = processed_frame_count
-                progress_emit_step = max(1, chunk_frame_count // 8)
-                for frame in composed_output:
-                    if cancel_event.is_set():
-                        note_terminal("job_cancelled")
-                        emit("job_cancelled", {})
-                        raise SystemExit(0)
-                    try:
-                        encoder.write_frame(_float_frame_to_rgb24(frame))
-                    except (BrokenPipeError, OSError) as exc:
-                        encode_detail = _describe_encode_stream_failure(encoder, exc)
-                        log(
-                            "error",
-                            "encode_stream_failure",
-                            "phase_processing",
-                            "The ffmpeg encoder stopped accepting frames during phase processing.",
-                            {"error": encode_detail},
-                        )
-                        emit_failure(
-                            "encode_failure",
-                            "phase_processing",
-                            detail=encode_detail,
-                            exception_type=type(exc).__name__,
-                        )
-                        raise SystemExit(1)
-                    processed_frame_count += 1
-                    frame_index_in_chunk = processed_frame_count - chunk_start_frame_count
-                    if (
-                        frame_index_in_chunk == chunk_frame_count
-                        or frame_index_in_chunk % progress_emit_step == 0
-                    ):
-                        decode_counter = decoder.take_progress_counter() or (
-                            processed_frame_count
-                            + max(chunk_frame_count - frame_index_in_chunk, 0)
-                        )
-                        encode_counter = encoder.take_progress_counter() or processed_frame_count
-                        emit(
-                            "progress_update",
-                            {
-                                "progress_token": f"batch:{processed_frame_count}",
-                                "stage": "phase_processing",
-                                "frames_completed": processed_frame_count,
-                                "total_frames": working_probe.frame_count,
-                                "decode_frames_completed": decode_counter,
-                                "encoded_frames_completed": encode_counter,
-                            },
-                        )
-                del composed_output
-                del passthrough_output
-                del amplified_output
-                del amplified_processing
-                del processing_chunk
-                del source_chunk
-                # PERF: gc.collect() moved out of per-frame loop. Memory is freed via del above;
-                # collect() will happen after chunk processing completes, not per-frame.
-                # This reduces CPU overhead in the hot loop ~15-20%.
-
-            # PERF: Single gc.collect() after chunk processing to clean up accumulated frame memory
-            gc.collect()
-
-            decode_exit = decoder.close()
+                raise_pipeline_failure_if_present()
+                decode_thread.join(timeout=0.05)
+                compute_thread.join(timeout=0.05)
+            raise_pipeline_failure_if_present()
             record_stage_transition("encode")
             emit("stage_started", {"stage": "encode", "total_frames": working_probe.frame_count})
-            log("info", "stage_started", "encode", "Waiting for encoder drain and exit.")
-            encoder_exit_code = encoder.finish()
+            log(
+                "info",
+                "stage_started",
+                "encode",
+                "Waiting for the bounded encoder queue to drain and the ffmpeg encoder to exit.",
+                {"internal_queue_depth": _PIPELINE_QUEUE_DEPTH},
+            )
+            while encode_thread.is_alive():
+                if cancel_event.is_set():
+                    note_terminal("job_cancelled")
+                    emit("job_cancelled", {})
+                    raise SystemExit(0)
+                raise_pipeline_failure_if_present()
+                encode_thread.join(timeout=0.05)
+            raise_pipeline_failure_if_present()
         finally:
-            # PERF: Clean up decode-ahead thread and buffer
-            # Signal EOF to unblock any waiting on buffer, then join thread
-            try:
-                decode_buffer.put_eof()
-            except Exception:
-                pass  # Buffer may already be closed
-            decode_thread.join(timeout=5.0)
-            
-            if decode_exit is None:
-                decoder.cancel()
-            if encoder_exit_code is None:
-                encoder.cancel()
+            pipeline_stop.set()
+            decode_thread.join(timeout=1.0)
+            compute_thread.join(timeout=1.0)
+            encode_thread.join(timeout=1.0)
 
         if decode_exit != 0 or processed_frame_count == 0:
             emit_failure("decode_failure", "phase_processing")
+            raise SystemExit(1)
+        if encoder_exit_code != 0:
+            emit_failure("encode_failure", "encode")
             raise SystemExit(1)
 
         try:
@@ -828,99 +1014,53 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
         record_stage_transition("finalize")
         emit("stage_started", {"stage": "finalize", "total_frames": working_probe.frame_count})
         log("info", "stage_started", "finalize", "Writing sidecar and finalizing output pair.")
-        
-        # PERF: Background analysis finalization thread
-        # Parallelize analysis export computation with output pair finalization (both I/O-bound).
-        # Provides 5-10% throughput improvement by overlapping analysis CSV writing with
-        # staging area finalization and file moves.
-        analysis_export: Any = None
-        analysis_finalize_thread: threading.Thread | None = None
-        analysis_finalize_error: Exception | None = None
-        
-        def _finalize_analysis() -> None:
-            """Background thread for analysis finalization."""
-            nonlocal analysis_export, analysis_finalize_error
-            try:
-                if request.intent.analysis.enabled:
-                    if analysis_analyzer is not None:
-                        try:
-                            analysis_export = analysis_analyzer.finalize(request.paths.output_directory)
-                        except Exception as exc:
-                            analysis_finalize_error = exc
-                            analysis_warning_local = (
-                                "Quantitative analysis export failed after render completion: "
-                                f"{exc}"
-                            )
-                            log(
-                                "warning",
-                                "analysis_export_failed",
-                                "finalize",
-                                analysis_warning_local,
-                            )
-                            emit("warning", {"messages": [analysis_warning_local]})
-                            analysis_export = build_empty_analysis_export(
-                                roi=request.intent.analysis.roi,
-                                roi_mode=(
-                                    "whole_frame"
-                                    if request.intent.analysis.roi is None
-                                    else "manual"
-                                ),
-                                roi_label=(
-                                    "Whole-frame ROI"
-                                    if request.intent.analysis.roi is None
-                                    else "Manual ROI"
-                                ),
-                                warning=analysis_warning_local,
-                                output_directory=request.paths.output_directory,
-                            )
-                    elif analysis_collection_warning is not None:
-                        analysis_export = build_empty_analysis_export(
-                            roi=request.intent.analysis.roi,
-                            roi_mode=(
-                                "whole_frame"
-                                if request.intent.analysis.roi is None
-                                else "manual"
-                            ),
-                            roi_label=(
-                                "Whole-frame ROI"
-                                if request.intent.analysis.roi is None
-                                else "Manual ROI"
-                            ),
-                            warning=analysis_collection_warning,
-                            output_directory=request.paths.output_directory,
-                        )
-            except Exception as exc:
-                analysis_finalize_error = exc
-        
-        # Start background analysis finalization in parallel with output finalization
         if request.intent.analysis.enabled:
-            analysis_finalize_thread = threading.Thread(
-                target=_finalize_analysis,
-                daemon=False,
-            )
-            analysis_finalize_thread.start()
-        
-        # While analysis runs in background, finalize output pair
-        finalization = finalize_output_pair(
-            staged_mp4=request.paths.staged_mp4_path,
-            staged_sidecar=request.paths.staged_sidecar_path,
-            final_mp4=request.paths.final_mp4_path,
-            final_sidecar=request.paths.final_sidecar_path,
-            failed_evidence_dir=request.paths.failed_evidence_directory,
-        )
-        
-        # Wait for background analysis finalization to complete before building sidecar
-        if analysis_finalize_thread is not None:
-            analysis_finalize_thread.join(timeout=120.0)
-            if analysis_finalize_thread.is_alive():
-                log(
-                    "warning",
-                    "analysis_timeout",
-                    "finalize",
-                    "Background analysis finalization did not complete within timeout.",
+            if analysis_analyzer is not None:
+                try:
+                    analysis_export = analysis_analyzer.finalize(request.paths.output_directory)
+                except Exception as exc:
+                    analysis_warning = (
+                        "Quantitative analysis export failed after render completion: "
+                        f"{exc}"
+                    )
+                    log(
+                        "warning",
+                        "analysis_export_failed",
+                        "finalize",
+                        analysis_warning,
+                    )
+                    emit("warning", {"messages": [analysis_warning]})
+                    analysis_export = build_empty_analysis_export(
+                        roi=request.intent.analysis.roi,
+                        roi_mode=(
+                            "whole_frame"
+                            if request.intent.analysis.roi is None
+                            else "manual"
+                        ),
+                        roi_label=(
+                            "Whole-frame ROI"
+                            if request.intent.analysis.roi is None
+                            else "Manual ROI"
+                        ),
+                        warning=analysis_warning,
+                        output_directory=request.paths.output_directory,
+                    )
+            elif analysis_collection_warning is not None:
+                analysis_export = build_empty_analysis_export(
+                    roi=request.intent.analysis.roi,
+                    roi_mode=(
+                        "whole_frame"
+                        if request.intent.analysis.roi is None
+                        else "manual"
+                    ),
+                    roi_label=(
+                        "Whole-frame ROI"
+                        if request.intent.analysis.roi is None
+                        else "Manual ROI"
+                    ),
+                    warning=analysis_collection_warning,
+                    output_directory=request.paths.output_directory,
                 )
-        
-        # Now build sidecar with analysis data
         sidecar_payload = _build_sidecar_payload(
             request=request,
             probe=probe,
@@ -938,7 +1078,14 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             json.dumps(sidecar_payload, indent=2),
             encoding="utf-8",
         )
-        
+
+        finalization = finalize_output_pair(
+            staged_mp4=request.paths.staged_mp4_path,
+            staged_sidecar=request.paths.staged_sidecar_path,
+            final_mp4=request.paths.final_mp4_path,
+            final_sidecar=request.paths.final_sidecar_path,
+            failed_evidence_dir=request.paths.failed_evidence_directory,
+        )
         _handle_finalization_result(finalization, emit, log)
         if finalization.status != "completed":
             note_terminal(
@@ -1174,9 +1321,14 @@ def _write_bundle_if_possible(
         "thread_limit": None if scheduler is None else scheduler.thread_limit,
         "precision_bytes": None if scheduler is None else scheduler.precision_bytes,
         "decode_pass_count": 2,
-        "pipeline_mode": "two_pass_streaming_batches",
+        "pipeline_mode": "two_pass_bounded_threaded_pipeline",
+        "internal_queue_depth": _PIPELINE_QUEUE_DEPTH,
         "ffmpeg_thread_args": ["-threads", "1"],
-        "effective_thread_limits": {"python_worker": 1},
+        "effective_thread_limits": {
+            "python_worker_compute": 1,
+            "python_pipeline_stage_threads": 3,
+            "python_heartbeat_threads": 1,
+        },
     }
     memory_payload = {
         "available_ram_bytes": None if budgets is None else budgets.available_ram_bytes,
@@ -1225,7 +1377,7 @@ def _write_bundle_if_possible(
                 "detail": failure_detail,
                 "exception_type": failure_exception_type,
             },
-            intermediate_storage_policy="two_pass_streaming_rgb24_batches",
+            intermediate_storage_policy="two_pass_bounded_rgb24_pipeline",
         )
     )
 
@@ -1293,10 +1445,24 @@ def _build_resource_budget(paths: RenderPaths, retention_budget_bytes: int) -> R
     )
 
 
-def _bytes_to_float_frames(frame_bytes: list[bytes], *, width: int, height: int) -> np.ndarray:
-    array = np.frombuffer(b"".join(frame_bytes), dtype=np.uint8)
-    frames = array.reshape(len(frame_bytes), height, width, 3)
-    return (frames.astype(np.float32) / 255.0).copy()
+def _bytes_to_float_frames(
+    frame_bytes: bytes | bytearray | memoryview,
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    frame_size = width * height * 3
+    frame_count = len(frame_bytes) // max(frame_size, 1)
+    array = np.frombuffer(frame_bytes, dtype=np.uint8, count=frame_count * frame_size)
+    frames = array.reshape(frame_count, height, width, 3)
+    float_frames = np.empty(frames.shape, dtype=np.float32)
+    np.multiply(
+        frames,
+        np.float32(1.0 / 255.0),
+        out=float_frames,
+        casting="unsafe",
+    )
+    return float_frames
 
 
 def _frames_to_luma(frames_rgb: np.ndarray) -> np.ndarray:
@@ -1310,8 +1476,9 @@ def _frames_to_luma(frames_rgb: np.ndarray) -> np.ndarray:
     ).astype(np.float32, copy=False)
 
 
-def _float_frame_to_rgb24(frame: np.ndarray) -> bytes:
-    frame_uint8 = np.clip(np.round(frame * 255.0), 0, 255).astype(np.uint8)
+def _float_frames_to_rgb24_bytes(frames: np.ndarray) -> bytes:
+    clipped = np.clip(frames, 0.0, 1.0)
+    frame_uint8 = np.rint(clipped * np.float32(255.0)).astype(np.uint8)
     return frame_uint8.tobytes()
 
 
@@ -1399,7 +1566,11 @@ def _build_sidecar_payload(
         ffmpeg_version=_query_tool_version(toolchain.ffmpeg),
         ffprobe_version=_query_tool_version(toolchain.ffprobe),
         scheduler_clamp_threads=1,
-        effective_thread_limits={"python_worker": 1},
+        effective_thread_limits={
+            "python_worker_compute": 1,
+            "python_pipeline_stage_threads": 3,
+            "python_heartbeat_threads": 1,
+        },
     )
     preflight_summary = PreflightSummary(
         source_fps=probe.avg_fps or probe.fps or 1.0,

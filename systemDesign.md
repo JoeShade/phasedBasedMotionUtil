@@ -418,8 +418,11 @@ It determines:
 
 V1 concurrency is intentionally conservative:
 - one render worker process per attempt
-- one main stage-execution thread inside the worker
 - one dedicated control/heartbeat thread inside the worker
+- one decode-reader thread inside the worker for the active processing pass
+- one compute thread inside the worker that owns chunk order, phase-filter state, and deterministic numeric work
+- one encode-writer thread inside the worker for the active processing pass
+- bounded worker-internal queues between those stage threads; v1 keeps them intentionally small and records the applied depth
 - no nested Python multiprocessing inside the render worker
 - ffmpeg subprocesses for decode and encode as needed
 - bounded native-library thread pools for BLAS/OpenMP/OpenCV/codec-related libraries
@@ -1663,6 +1666,19 @@ Rules:
 - the worker owns backpressure and must prevent unbounded buffering
 - raw decoded chunk transfer, not generic child chatter, is the data plane
 
+### 33.7C Worker-internal stage pipeline
+
+For the bounded processing pass, the worker may use a small internal stage pipeline.
+
+Rules:
+- decode/input reading, numeric processing, and encode/input writing may overlap inside the worker
+- chunk order must remain strictly sequential and deterministic end-to-end
+- the compute stage is the only stage allowed to own the streaming phase-filter state
+- internal hand-off queues must be bounded and must act as the backpressure boundary
+- v1 keeps these queues intentionally small rather than trying to maximize speculative prefetch
+- the applied queue depth and worker-internal stage-thread counts must be recorded in diagnostics
+- this worker-internal pipeline does not relax the single-active-render rule and does not authorize nested render-worker fan-out
+
 ### 33.7A Source normalization contract
 
 Drift review and phase processing operate on a normalized working source representation.
@@ -1685,7 +1701,8 @@ Rules:
 - the worker must not require the full clip to be resident in RAM at once
 - global reference statistics may be accumulated across a bounded scan pass, then reused during the bounded processing pass
 - chunk-size decisions may be reduced at job start to fit the measured RAM budget and selected resource policy
-- per-batch arrays must be released after each bounded work window so long clips can exceed available RAM as long as the batch plan remains admissible
+- per-batch arrays and queued hand-off buffers must be released after each bounded work window so long clips can exceed available RAM as long as the batch plan remains admissible
+- bounded internal stage queues are part of the RAM contract and must not grow without an explicit scheduler decision
 - a true allocation failure after admission remains terminal and must still be classified as out-of-memory
 
 ### 33.8 Child shutdown rationale
@@ -1772,6 +1789,8 @@ Every run must record the concurrency settings actually applied, including:
 - ffmpeg thread arguments
 - OpenCV thread limit if used
 - BLAS/OpenMP-related environment limits
+- worker-internal stage-thread counts
+- worker-internal queue depth
 - any stricter runtime clamp chosen by the scheduler
 
 These values belong in:

@@ -32,12 +32,12 @@ def _spawn_context() -> multiprocessing.context.SpawnContext:
     return multiprocessing.get_context("spawn")
 
 
-def _create_motion_test_video(path: Path) -> None:
+def _create_motion_test_video(path: Path, *, frame_count: int = 12) -> None:
     tools = resolve_toolchain()
     width = 16
     height = 16
     frames: list[bytes] = []
-    for index in range(12):
+    for index in range(frame_count):
         offset = index % 4
         frame = bytearray()
         for _y in range(height):
@@ -212,7 +212,9 @@ def test_render_worker_produces_final_mp4_and_sidecar(tmp_path: Path) -> None:
     )
     assert bundle_payload["diagnostics_cap_bytes"] == request.diagnostics_cap_bytes
     assert bundle_payload["scheduler_decisions"]["decode_pass_count"] == 2
-    assert bundle_payload["intermediate_storage_policy"] == "two_pass_streaming_rgb24_batches"
+    assert bundle_payload["scheduler_decisions"]["pipeline_mode"] == "two_pass_bounded_threaded_pipeline"
+    assert bundle_payload["scheduler_decisions"]["internal_queue_depth"] == 1
+    assert bundle_payload["intermediate_storage_policy"] == "two_pass_bounded_rgb24_pipeline"
     assert "roi_metrics" in bundle_payload["artifact_paths"]
 
 
@@ -368,3 +370,74 @@ def test_render_worker_reports_incremental_phase_processing_frame_progress(
     assert len(frame_progress) >= 2
     assert frame_progress == sorted(frame_progress)
     assert frame_progress[-1] == 12
+
+
+def test_render_worker_handles_partial_final_pipeline_chunk(tmp_path: Path) -> None:
+    source_path = tmp_path / "source-tail.mkv"
+    _create_motion_test_video(source_path, frame_count=26)
+    request = RenderRequest(
+        job_id="job-render-tail",
+        intent=JobIntent(
+            phase=PhaseSettings(
+                magnification=3.0,
+                low_hz=1.0,
+                high_hz=4.0,
+                pyramid_type="complex_steerable",
+                sigma=1.0,
+                attenuate_other_frequencies=True,
+            ),
+            processing_resolution=Resolution(16, 16),
+            output_resolution=Resolution(16, 16),
+            resource_policy=ResourcePolicy.CONSERVATIVE,
+            mask_feather_px=4.0,
+        ),
+        paths=RenderPaths(
+            source_path=source_path,
+            output_directory=tmp_path / "output",
+            output_stem="result",
+            scratch_directory=tmp_path / "scratch",
+            diagnostics_directory=tmp_path / "diagnostics",
+        ),
+        expected_source_fingerprint_sha256=_sha256(source_path),
+        diagnostic_level=DiagnosticLevel.BASIC,
+        diagnostics_cap_bytes=128 * 1024 * 1024,
+        retention_budget_bytes=1,
+        drift_assessment=DriftAssessment(),
+    )
+    ctx = _spawn_context()
+    cancel_event = ctx.Event()
+    session = SessionConfig(
+        session_token="token-render-tail",
+        job_id=request.job_id,
+        role="render",
+    )
+    server = open_loopback_server()
+    host, port = server.getsockname()
+    process = ctx.Process(
+        target=render_worker_process_main,
+        args=(
+            RenderWorkerConfig(
+                host=host,
+                port=port,
+                session_token=session.session_token,
+                job_id=session.job_id,
+                role=session.role,
+                request=request,
+            ),
+            cancel_event,
+        ),
+    )
+    process.start()
+
+    try:
+        connection_socket, _ = server.accept()
+        connection = JsonLineConnection(connection_socket)
+        perform_shell_handshake(connection, session)
+        messages = _drain_messages(connection, session)
+    finally:
+        process.join(timeout=60.0)
+        server.close()
+
+    assert process.exitcode == 0
+    assert any(message["message_type"] == "job_completed" for message in messages)
+    assert request.paths.final_mp4_path.exists()

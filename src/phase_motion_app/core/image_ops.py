@@ -41,7 +41,23 @@ def resize_rgb_frames_bilinear(frames: np.ndarray, target: Resolution) -> np.nda
     ):
         return frames.astype(np.float32, copy=False)
 
-    return np.stack(
-        [resize_rgb_frame_bilinear(frame, target) for frame in frames],
-        axis=0,
-    ).astype(np.float32)
+    source_height = frames.shape[1]
+    source_width = frames.shape[2]
+    x = np.linspace(0.0, source_width - 1, target.width)
+    y = np.linspace(0.0, source_height - 1, target.height)
+    x0 = np.floor(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    x1 = np.clip(x0 + 1, 0, source_width - 1)
+    y1 = np.clip(y0 + 1, 0, source_height - 1)
+    wx = (x - x0).astype(np.float32)
+    wy = (y - y0).astype(np.float32)
+
+    # The resize grid is the same for every frame in the chunk, so build it
+    # once and apply it across the whole stack instead of looping in Python.
+    rows0 = frames[:, y0, :, :]
+    rows1 = frames[:, y1, :, :]
+    interp_y = rows0 * (1.0 - wy)[None, :, None, None] + rows1 * wy[None, :, None, None]
+    cols0 = interp_y[:, :, x0, :]
+    cols1 = interp_y[:, :, x1, :]
+    resized = cols0 * (1.0 - wx)[None, None, :, None] + cols1 * wx[None, None, :, None]
+    return resized.astype(np.float32, copy=False)

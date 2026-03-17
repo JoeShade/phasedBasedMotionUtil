@@ -33,7 +33,7 @@ class WatchdogState:
         self.last_telemetry_at: float | None = None
         self.last_progress_at: float | None = None
         self.last_progress_token: int | str | None = None
-        self.last_child_counter: int | None = None
+        self.last_child_counters: dict[str, int] = {}
         self.terminal_message_type: str | None = None
 
     def record_telemetry(self, *, received_at: float) -> None:
@@ -70,11 +70,18 @@ class WatchdogState:
             self.terminal_message_type = message_type
             self.last_progress_at = received_at
 
-    def record_child_progress(self, *, counter: int, received_at: float) -> None:
+    def record_child_progress(
+        self,
+        *,
+        counter: int,
+        received_at: float,
+        channel: str = "child",
+    ) -> None:
         """Record authoritative child progress such as ffmpeg machine-readable counters."""
 
-        if self.last_child_counter is None or counter > self.last_child_counter:
-            self.last_child_counter = counter
+        previous = self.last_child_counters.get(channel)
+        if previous is None or counter > previous:
+            self.last_child_counters[channel] = counter
             self.last_progress_at = received_at
 
     def evaluate(

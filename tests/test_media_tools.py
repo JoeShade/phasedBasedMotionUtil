@@ -58,6 +58,44 @@ def _create_two_frame_test_video(path: Path) -> None:
     )
 
 
+def _create_three_frame_test_video(path: Path) -> None:
+    tools = resolve_toolchain()
+    width = 4
+    height = 4
+    red_frame = bytes([255, 0, 0] * width * height)
+    green_frame = bytes([0, 255, 0] * width * height)
+    blue_frame = bytes([0, 0, 255] * width * height)
+    subprocess.run(
+        [
+            str(tools.ffmpeg),
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            "3",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "libx264rgb",
+            "-crf",
+            "0",
+            "-preset",
+            "ultrafast",
+            str(path),
+        ],
+        input=red_frame + green_frame + blue_frame,
+        check=True,
+        capture_output=True,
+    )
+
+
 def test_resolved_toolchain_paths_exist() -> None:
     tools = resolve_toolchain()
     assert tools.ffmpeg.exists()
@@ -242,6 +280,78 @@ def test_rawvideo_helpers_capture_ffmpeg_progress_counters(tmp_path: Path) -> No
     assert decoder.take_progress_counter() is not None
     assert decoder.take_progress_counter() >= 1
     assert encode_exit == 0
+
+
+def test_rawvideo_decode_process_can_return_one_packed_chunk(tmp_path: Path) -> None:
+    source_path = tmp_path / "packed-source.mkv"
+    _create_two_frame_test_video(source_path)
+
+    decoder = RawvideoDecodeProcess(
+        source_path=source_path,
+        output_resolution=Resolution(4, 4),
+    )
+    packed = decoder.read_chunk_bytes(2)
+    decode_exit = decoder.close()
+
+    assert decode_exit == 0
+    assert len(packed) == 2 * 4 * 4 * 3
+    assert packed[:3] == bytes([255, 0, 0])
+    assert packed[-3:] == bytes([0, 0, 255])
+
+
+def test_rawvideo_encode_process_accepts_packed_multi_frame_write(tmp_path: Path) -> None:
+    source_path = tmp_path / "packed-write-source.mkv"
+    staged_output_path = tmp_path / "packed-write-output.mp4"
+    _create_two_frame_test_video(source_path)
+
+    decoder = RawvideoDecodeProcess(
+        source_path=source_path,
+        output_resolution=Resolution(4, 4),
+    )
+    packed = decoder.read_chunk_bytes(2)
+    decode_exit = decoder.close()
+
+    encoder = RawvideoEncodeProcess(
+        staged_output_path=staged_output_path,
+        resolution=Resolution(4, 4),
+        fps=2.0,
+        codec="libx264",
+        pixel_format="yuv420p",
+        color_tags={
+            "color_primaries": "bt709",
+            "color_transfer": "bt709",
+            "color_space": "bt709",
+            "color_range": "tv",
+        },
+    )
+    encoder.write_frames(packed)
+    encode_exit = encoder.finish()
+
+    info = FfprobeRunner().run(staged_output_path)
+
+    assert decode_exit == 0
+    assert encode_exit == 0
+    assert info.frame_count == 2
+
+
+def test_rawvideo_decode_process_handles_partial_final_chunk_without_buffer_error(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "partial-tail-source.mkv"
+    _create_three_frame_test_video(source_path)
+
+    decoder = RawvideoDecodeProcess(
+        source_path=source_path,
+        output_resolution=Resolution(4, 4),
+    )
+    first_chunk = decoder.read_chunk_bytes(2)
+    second_chunk = decoder.read_chunk_bytes(2)
+    decode_exit = decoder.close()
+
+    assert decode_exit == 0
+    assert len(first_chunk) == 2 * 4 * 4 * 3
+    assert len(second_chunk) == 1 * 4 * 4 * 3
+    assert second_chunk[:3] == bytes([0, 0, 255])
 
 
 class _FakePipe:

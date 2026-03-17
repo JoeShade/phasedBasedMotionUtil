@@ -47,6 +47,24 @@ def test_watchdog_child_progress_clears_stall_timer() -> None:
     assert decision.status == "running"
 
 
+def test_watchdog_tracks_decode_and_encode_child_counters_independently() -> None:
+    watchdog = WatchdogState()
+    watchdog.record_message(message_type="stage_started", received_at=0.0)
+    watchdog.record_child_progress(channel="decode", counter=100, received_at=1.0)
+    watchdog.record_child_progress(channel="encode", counter=10, received_at=2.0)
+    watchdog.record_child_progress(channel="encode", counter=20, received_at=2.5)
+    watchdog.record_message(message_type="heartbeat", received_at=3.0)
+
+    decision = watchdog.evaluate(
+        now=4.0,
+        process_alive=True,
+        exitcode=None,
+        thresholds=_thresholds(),
+    )
+
+    assert decision.status == "running"
+
+
 def test_watchdog_reports_soft_then_hard_unresponsive_classification() -> None:
     watchdog = WatchdogState()
     watchdog.record_message(message_type="heartbeat", received_at=0.0)

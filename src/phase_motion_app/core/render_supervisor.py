@@ -322,6 +322,21 @@ class RenderSupervisor:
                 received_at=now,
                 progress_token=progress_token,
             )
+            if message_type == "progress_update":
+                decode_counter = payload.get("decode_frames_completed")
+                if isinstance(decode_counter, int):
+                    self._watchdog.record_child_progress(
+                        channel="decode",
+                        counter=decode_counter,
+                        received_at=now,
+                    )
+                encode_counter = payload.get("encoded_frames_completed")
+                if isinstance(encode_counter, int):
+                    self._watchdog.record_child_progress(
+                        channel="encode",
+                        counter=encode_counter,
+                        received_at=now,
+                    )
             self._apply_message(message_type, payload)
             events.append(RenderEvent(message_type=message_type, payload=payload, received_at=now))
         return events
