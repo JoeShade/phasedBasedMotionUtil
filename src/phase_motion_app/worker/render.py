@@ -11,6 +11,7 @@ import socket
 import subprocess
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 from multiprocessing.synchronize import Event as EventType
 from pathlib import Path
@@ -42,6 +43,11 @@ from phase_motion_app.core.media_tools import (
 )
 from phase_motion_app.core.models import ObservedEnvironment, PreflightSummary, SourceRecord
 from phase_motion_app.core.phase_engine import StreamingPhaseAmplifier
+from phase_motion_app.core.quantitative_analysis import (
+    StreamingQuantitativeAnalyzer,
+    build_disabled_analysis_export,
+    build_empty_analysis_export,
+)
 from phase_motion_app.core.preflight import (
     PreflightSeverity,
     ResourceBudget,
@@ -135,6 +141,8 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
     last_progress_token: int | None = None
     failure_classification: str | None = None
     failure_stage: str | None = None
+    failure_detail: str | None = None
+    failure_exception_type: str | None = None
     fingerprint: str | None = None
     probe = None
     working_probe = None
@@ -145,6 +153,8 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
     budgets = None
     preflight = None
     diagnostics_bundle_path = request.paths.diagnostics_directory / "diagnostics_bundle.json"
+    analysis_export = build_disabled_analysis_export(request.intent.analysis)
+    analysis_collection_warning: str | None = None
 
     def emit(message_type: str, payload: dict | None = None) -> None:
         nonlocal last_emitted_message_type, last_progress_token
@@ -181,21 +191,47 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
         current_stage = next_stage
         current_stage_started_at = now
 
-    def note_terminal(message_type: str, *, classification: str | None = None, stage: str | None = None) -> None:
+    def note_terminal(
+        message_type: str,
+        *,
+        classification: str | None = None,
+        stage: str | None = None,
+        detail: str | None = None,
+        exception_type: str | None = None,
+    ) -> None:
         nonlocal terminal_message_type, failure_classification, failure_stage
+        nonlocal failure_detail, failure_exception_type
         terminal_message_type = message_type
         if classification is not None:
             failure_classification = classification
         if stage is not None:
             failure_stage = stage
+        if detail is not None:
+            failure_detail = detail
+        if exception_type is not None:
+            failure_exception_type = exception_type
 
-    def emit_failure(classification: str, stage: str) -> None:
-        note_terminal("failure", classification=classification, stage=stage)
+    def emit_failure(
+        classification: str,
+        stage: str,
+        *,
+        detail: str | None = None,
+        exception_type: str | None = None,
+    ) -> None:
+        note_terminal(
+            "failure",
+            classification=classification,
+            stage=stage,
+            detail=detail,
+            exception_type=exception_type,
+        )
         emit(
             "failure",
             {
                 "classification": classification,
                 "stage": stage,
+                **({} if detail is None else {"detail": detail}),
+                **({} if exception_type is None else {"exception_type": exception_type}),
             },
         )
 
@@ -440,6 +476,31 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             sigma=request.intent.phase.sigma,
             attenuate_other_frequencies=request.intent.phase.attenuate_other_frequencies,
         )
+        analysis_analyzer = None
+        if request.intent.analysis.enabled:
+            try:
+                analysis_analyzer = StreamingQuantitativeAnalyzer(
+                    settings=request.intent.analysis,
+                    processing_resolution=request.intent.processing_resolution,
+                    fps=working_plan.working_fps,
+                    low_hz=request.intent.phase.low_hz,
+                    high_hz=request.intent.phase.high_hz,
+                    reference_luma=reference_luma,
+                    exclusion_zones=request.intent.exclusion_zones,
+                    drift_assessment=request.drift_assessment,
+                )
+            except Exception as exc:
+                analysis_collection_warning = (
+                    "Quantitative analysis could not be initialized and was disabled for "
+                    f"this render: {exc}"
+                )
+                log(
+                    "warning",
+                    "analysis_initialization_failed",
+                    "phase_processing",
+                    analysis_collection_warning,
+                )
+                emit("warning", {"messages": [analysis_collection_warning]})
 
         record_stage_transition("phase_processing")
         emit(
@@ -501,6 +562,22 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                     source_chunk,
                     request.intent.processing_resolution,
                 )
+                if analysis_analyzer is not None:
+                    try:
+                        analysis_analyzer.add_chunk(processing_chunk)
+                    except Exception as exc:
+                        analysis_collection_warning = (
+                            "Quantitative analysis collection failed during phase processing "
+                            f"and was disabled for the rest of the render: {exc}"
+                        )
+                        log(
+                            "warning",
+                            "analysis_collection_failed",
+                            "phase_processing",
+                            analysis_collection_warning,
+                        )
+                        emit("warning", {"messages": [analysis_collection_warning]})
+                        analysis_analyzer = None
                 amplified_processing = phase_amplifier.process_chunk(
                     processing_chunk,
                     progress_callback=report_phase_progress,
@@ -516,27 +593,54 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                 composed_output = passthrough_output * mask_array[None, :, :, None] + (
                     amplified_output * (1.0 - mask_array[None, :, :, None])
                 )
+                chunk_frame_count = source_chunk.shape[0]
+                chunk_start_frame_count = processed_frame_count
+                progress_emit_step = max(1, chunk_frame_count // 8)
                 for frame in composed_output:
                     if cancel_event.is_set():
                         note_terminal("job_cancelled")
                         emit("job_cancelled", {})
                         raise SystemExit(0)
-                    encoder.write_frame(_float_frame_to_rgb24(frame))
-
-                processed_frame_count += source_chunk.shape[0]
-                decode_counter = decoder.take_progress_counter() or processed_frame_count
-                encode_counter = encoder.take_progress_counter() or processed_frame_count
-                emit(
-                    "progress_update",
-                    {
-                        "progress_token": f"batch:{processed_frame_count}",
-                        "stage": "phase_processing",
-                        "frames_completed": processed_frame_count,
-                        "total_frames": working_probe.frame_count,
-                        "decode_frames_completed": decode_counter,
-                        "encoded_frames_completed": encode_counter,
-                    },
-                )
+                    try:
+                        encoder.write_frame(_float_frame_to_rgb24(frame))
+                    except (BrokenPipeError, OSError) as exc:
+                        encode_detail = _describe_encode_stream_failure(encoder, exc)
+                        log(
+                            "error",
+                            "encode_stream_failure",
+                            "phase_processing",
+                            "The ffmpeg encoder stopped accepting frames during phase processing.",
+                            {"error": encode_detail},
+                        )
+                        emit_failure(
+                            "encode_failure",
+                            "phase_processing",
+                            detail=encode_detail,
+                            exception_type=type(exc).__name__,
+                        )
+                        raise SystemExit(1)
+                    processed_frame_count += 1
+                    frame_index_in_chunk = processed_frame_count - chunk_start_frame_count
+                    if (
+                        frame_index_in_chunk == chunk_frame_count
+                        or frame_index_in_chunk % progress_emit_step == 0
+                    ):
+                        decode_counter = decoder.take_progress_counter() or (
+                            processed_frame_count
+                            + max(chunk_frame_count - frame_index_in_chunk, 0)
+                        )
+                        encode_counter = encoder.take_progress_counter() or processed_frame_count
+                        emit(
+                            "progress_update",
+                            {
+                                "progress_token": f"batch:{processed_frame_count}",
+                                "stage": "phase_processing",
+                                "frames_completed": processed_frame_count,
+                                "total_frames": working_probe.frame_count,
+                                "decode_frames_completed": decode_counter,
+                                "encoded_frames_completed": encode_counter,
+                            },
+                        )
                 del composed_output
                 del passthrough_output
                 del amplified_output
@@ -613,6 +717,53 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
         record_stage_transition("finalize")
         emit("stage_started", {"stage": "finalize", "total_frames": working_probe.frame_count})
         log("info", "stage_started", "finalize", "Writing sidecar and finalizing output pair.")
+        if request.intent.analysis.enabled:
+            if analysis_analyzer is not None:
+                try:
+                    analysis_export = analysis_analyzer.finalize(request.paths.output_directory)
+                except Exception as exc:
+                    analysis_warning = (
+                        "Quantitative analysis export failed after render completion: "
+                        f"{exc}"
+                    )
+                    log(
+                        "warning",
+                        "analysis_export_failed",
+                        "finalize",
+                        analysis_warning,
+                    )
+                    emit("warning", {"messages": [analysis_warning]})
+                    analysis_export = build_empty_analysis_export(
+                        roi=request.intent.analysis.roi,
+                        roi_mode=(
+                            "whole_frame"
+                            if request.intent.analysis.roi is None
+                            else "manual"
+                        ),
+                        roi_label=(
+                            "Whole-frame ROI"
+                            if request.intent.analysis.roi is None
+                            else "Manual ROI"
+                        ),
+                        warning=analysis_warning,
+                        output_directory=request.paths.output_directory,
+                    )
+            elif analysis_collection_warning is not None:
+                analysis_export = build_empty_analysis_export(
+                    roi=request.intent.analysis.roi,
+                    roi_mode=(
+                        "whole_frame"
+                        if request.intent.analysis.roi is None
+                        else "manual"
+                    ),
+                    roi_label=(
+                        "Whole-frame ROI"
+                        if request.intent.analysis.roi is None
+                        else "Manual ROI"
+                    ),
+                    warning=analysis_collection_warning,
+                    output_directory=request.paths.output_directory,
+                )
         sidecar_payload = _build_sidecar_payload(
             request=request,
             probe=probe,
@@ -623,6 +774,8 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             normalization_plan=normalization_plan,
             normalized_source_path=normalized_source_path,
             final_validation_errors=validation.errors,
+            analysis_export=analysis_export,
+            analysis_collection_warning=analysis_collection_warning,
         )
         request.paths.staged_sidecar_path.write_text(
             json.dumps(sidecar_payload, indent=2),
@@ -652,6 +805,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                 "sidecar": str(request.paths.final_sidecar_path),
                 "diagnostics": str(request.paths.diagnostics_directory),
                 "diagnostics_bundle": str(diagnostics_bundle_path),
+                **analysis_export.artifact_paths,
             },
         )
         note_terminal("job_completed")
@@ -671,9 +825,18 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             _classify_worker_exception(exc),
             current_stage,
             "Render worker hit a classified memory allocation failure.",
-            {"error": str(exc)},
+            {
+                "error": str(exc),
+                "exception_type": type(exc).__name__,
+                "traceback": traceback.format_exc(),
+            },
         )
-        emit_failure(_classify_worker_exception(exc), current_stage)
+        emit_failure(
+            _classify_worker_exception(exc),
+            current_stage,
+            detail=_format_worker_exception_detail(exc),
+            exception_type=type(exc).__name__,
+        )
         raise SystemExit(1)
     except Exception as exc:  # pragma: no cover - defensive worker path.
         classification = _classify_worker_exception(exc)
@@ -681,15 +844,26 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             "failure",
             classification=classification,
             stage=current_stage,
+            detail=_format_worker_exception_detail(exc),
+            exception_type=type(exc).__name__,
         )
         log(
             "error",
             classification,
             current_stage,
             "Unhandled render worker exception.",
-            {"error": str(exc)},
+            {
+                "error": str(exc),
+                "exception_type": type(exc).__name__,
+                "traceback": traceback.format_exc(),
+            },
         )
-        emit_failure(classification, current_stage)
+        emit_failure(
+            classification,
+            current_stage,
+            detail=_format_worker_exception_detail(exc),
+            exception_type=type(exc).__name__,
+        )
         raise SystemExit(1)
     finally:
         stage_timings[current_stage] = stage_timings.get(current_stage, 0.0) + max(
@@ -714,6 +888,9 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             last_progress_token=last_progress_token,
             failure_classification=failure_classification,
             failure_stage=failure_stage,
+            failure_detail=failure_detail,
+            failure_exception_type=failure_exception_type,
+            analysis_artifact_paths=analysis_export.artifact_paths,
         )
         stop_heartbeat.set()
         heartbeat_thread.join(timeout=1.0)
@@ -732,6 +909,27 @@ def _classify_worker_exception(exc: BaseException) -> str:
     if isinstance(exc, MemoryError):
         return "out_of_memory"
     return "internal_processing_exception"
+
+
+def _format_worker_exception_detail(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__
+
+
+def _describe_encode_stream_failure(
+    encoder: RawvideoEncodeProcess,
+    exc: BaseException,
+) -> str:
+    detail = _format_worker_exception_detail(exc)
+    exit_code = encoder.process.poll()
+    ffmpeg_detail = encoder.latest_stderr_summary()
+    if exit_code is not None:
+        detail = f"{detail}. Encoder exit code {exit_code}."
+    if ffmpeg_detail:
+        return f"{detail} ffmpeg: {ffmpeg_detail}"
+    return detail
 
 
 def _write_bundle_if_possible(
@@ -753,6 +951,9 @@ def _write_bundle_if_possible(
     last_progress_token: int | None,
     failure_classification: str | None,
     failure_stage: str | None,
+    failure_detail: str | None,
+    failure_exception_type: str | None,
+    analysis_artifact_paths: dict[str, str],
 ) -> None:
     settings_snapshot = {
         "intent": request.intent.to_dict(),
@@ -865,11 +1066,14 @@ def _write_bundle_if_possible(
                 "sidecar": str(request.paths.final_sidecar_path),
                 "diagnostics": str(request.paths.diagnostics_directory),
                 "diagnostics_bundle": str(diagnostics_bundle_path),
+                **analysis_artifact_paths,
             },
             terminal_details={
                 "message_type": terminal_message_type,
                 "classification": failure_classification,
                 "stage": failure_stage,
+                "detail": failure_detail,
+                "exception_type": failure_exception_type,
             },
             intermediate_storage_policy="two_pass_streaming_rgb24_batches",
         )
@@ -1031,6 +1235,8 @@ def _build_sidecar_payload(
     normalization_plan: SourceNormalizationPlan | None,
     normalized_source_path: Path | None,
     final_validation_errors: tuple[str, ...],
+    analysis_export,
+    analysis_collection_warning: str | None,
 ) -> dict:
     toolchain = resolve_toolchain()
     observed_environment = ObservedEnvironment(
@@ -1083,16 +1289,20 @@ def _build_sidecar_payload(
         source_fingerprint_sha256=fingerprint,
         note="Reviewed in the drift-check editor.",
     )
+    warnings = [*codec_plan.warnings, *analysis_export.warnings]
+    if analysis_collection_warning is not None and analysis_collection_warning not in warnings:
+        warnings.append(analysis_collection_warning)
     results = {
         "render_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "source": source_record.to_dict(),
         "preflight": preflight_summary.to_dict(),
-        "warnings": list(codec_plan.warnings),
+        "warnings": warnings,
         "fallbacks": list(codec_plan.warnings),
         "artifact_paths": {
             "mp4": str(request.paths.final_mp4_path),
             "sidecar": str(request.paths.final_sidecar_path),
             "diagnostics": str(request.paths.diagnostics_directory),
+            **analysis_export.artifact_paths,
         },
         "diagnostics_summary": {
             "jsonl_log": str(request.paths.jsonl_log_path),
@@ -1113,6 +1323,7 @@ def _build_sidecar_payload(
                 "fps": working_probe.avg_fps or working_probe.fps or 1.0,
             },
         },
+        "analysis": analysis_export.summary,
     }
     if drift_ack is not None:
         results["drift_acknowledgement"] = drift_ack.to_dict()

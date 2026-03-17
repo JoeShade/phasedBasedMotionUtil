@@ -38,6 +38,14 @@ class ZoneMode(str, Enum):
     INCLUDE = "include"
 
 
+class AnalysisBandMode(str, Enum):
+    """This enum keeps the quantitative-analysis band-selection modes stable across UI, worker, and sidecar serialization."""
+
+    AUTO = "auto"
+    MANUAL_SINGLE = "manual_single"
+    MANUAL_MULTI = "manual_multi"
+
+
 @dataclass(frozen=True)
 class Resolution:
     """This small value object keeps width and height paired so downscale-only checks stay simple."""
@@ -129,6 +137,83 @@ class PhaseSettings:
 
 
 @dataclass(frozen=True)
+class AnalysisBand:
+    """This model stores one explicit quantitative-analysis band so manual-band settings and generated heatmap bands share one shape."""
+
+    band_id: str
+    low_hz: float
+    high_hz: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "band_id": self.band_id,
+            "low_hz": self.low_hz,
+            "high_hz": self.high_hz,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AnalysisBand":
+        return cls(
+            band_id=str(data["band_id"]),
+            low_hz=float(data["low_hz"]),
+            high_hz=float(data["high_hz"]),
+        )
+
+
+@dataclass(frozen=True)
+class AnalysisSettings:
+    """This model captures the small curated set of quantitative-analysis controls from the NVH extension design."""
+
+    enabled: bool = True
+    roi: ExclusionZone | None = None
+    minimum_cell_support_fraction: float = 0.35
+    roi_quality_cutoff: float = 0.45
+    low_confidence_threshold: float = 0.35
+    auto_band_count: int = 5
+    band_mode: AnalysisBandMode = AnalysisBandMode.AUTO
+    manual_bands: tuple[AnalysisBand, ...] = field(default_factory=tuple)
+    export_advanced_files: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "roi": None if self.roi is None else self.roi.to_dict(),
+            "minimum_cell_support_fraction": self.minimum_cell_support_fraction,
+            "roi_quality_cutoff": self.roi_quality_cutoff,
+            "low_confidence_threshold": self.low_confidence_threshold,
+            "auto_band_count": self.auto_band_count,
+            "band_mode": self.band_mode.value,
+            "manual_bands": [band.to_dict() for band in self.manual_bands],
+            "export_advanced_files": self.export_advanced_files,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AnalysisSettings":
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            roi=(
+                None
+                if data.get("roi") is None
+                else ExclusionZone.from_dict(data["roi"])
+            ),
+            minimum_cell_support_fraction=float(
+                data.get("minimum_cell_support_fraction", 0.35)
+            ),
+            roi_quality_cutoff=float(data.get("roi_quality_cutoff", 0.45)),
+            low_confidence_threshold=float(data.get("low_confidence_threshold", 0.35)),
+            auto_band_count=int(data.get("auto_band_count", 5)),
+            band_mode=AnalysisBandMode(
+                data.get("band_mode", AnalysisBandMode.AUTO.value)
+            ),
+            manual_bands=tuple(
+                AnalysisBand.from_dict(band_data)
+                for band_data in data.get("manual_bands", [])
+            ),
+            export_advanced_files=bool(data.get("export_advanced_files", True)),
+        )
+
+
+@dataclass(frozen=True)
 class JobIntent:
     """This model holds only the reproducible settings that the user meant to run again in the future."""
 
@@ -138,6 +223,7 @@ class JobIntent:
     resource_policy: ResourcePolicy
     exclusion_zones: tuple[ExclusionZone, ...] = field(default_factory=tuple)
     mask_feather_px: float = 4.0
+    analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
     output_container: str = "mp4"
     requested_output_codec: str = "prefer_hevc_main10"
 
@@ -149,6 +235,7 @@ class JobIntent:
             "resource_policy": self.resource_policy.value,
             "exclusion_zones": [zone.to_dict() for zone in self.exclusion_zones],
             "mask_feather_px": self.mask_feather_px,
+            "analysis": self.analysis.to_dict(),
             "output_container": self.output_container,
             "requested_output_codec": self.requested_output_codec,
         }
@@ -165,6 +252,7 @@ class JobIntent:
                 for zone_data in data.get("exclusion_zones", [])
             ),
             mask_feather_px=float(data.get("mask_feather_px", 4.0)),
+            analysis=AnalysisSettings.from_dict(data.get("analysis", {})),
             output_container=str(data.get("output_container", "mp4")),
             requested_output_codec=str(
                 data.get("requested_output_codec", "prefer_hevc_main10")
@@ -340,6 +428,7 @@ class JobResults:
     artifact_paths: dict[str, str] = field(default_factory=dict)
     diagnostics_summary: dict[str, Any] = field(default_factory=dict)
     output_details: dict[str, Any] = field(default_factory=dict)
+    analysis: dict[str, Any] = field(default_factory=dict)
     drift_acknowledgement: DriftAcknowledgement | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -354,6 +443,8 @@ class JobResults:
         }
         if self.output_details:
             data["output_details"] = self.output_details
+        if self.analysis:
+            data["analysis"] = self.analysis
         if self.drift_acknowledgement is not None:
             data["drift_acknowledgement"] = self.drift_acknowledgement.to_dict()
         return data
@@ -373,6 +464,7 @@ class JobResults:
             },
             diagnostics_summary=dict(data.get("diagnostics_summary", {})),
             output_details=dict(data.get("output_details", {})),
+            analysis=dict(data.get("analysis", {})),
             drift_acknowledgement=(
                 None
                 if drift_acknowledgement is None

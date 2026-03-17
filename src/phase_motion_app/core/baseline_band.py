@@ -53,14 +53,23 @@ def suggest_frequency_band_from_motion_trace(
     frequencies = np.fft.rfftfreq(centered.shape[0], d=1.0 / fps)
     amplitudes = np.abs(np.fft.rfft(centered)).astype(np.float32, copy=False)
     nyquist = fps / 2.0
-    search_max_hz = min(max_hz or (nyquist * 0.7), nyquist * 0.7, 2.5)
+    search_max_hz = min(max_hz or (nyquist * 0.85), nyquist * 0.85)
     search = (frequencies >= min_hz) & (frequencies <= search_max_hz)
     if np.count_nonzero(search) < 3:
         return None
 
     search_amplitudes = amplitudes[search]
     search_frequencies = frequencies[search]
-    peak_index = int(np.argmax(search_amplitudes))
+
+    # Improved peak detection: find all peaks above threshold
+    from scipy.signal import find_peaks
+    peaks, properties = find_peaks(search_amplitudes, height=np.median(search_amplitudes) * 1.2)
+    if len(peaks) == 0:
+        peak_index = int(np.argmax(search_amplitudes))
+    else:
+        # Pick the highest peak
+        peak_index = peaks[np.argmax(properties['peak_heights'])]
+
     peak_hz = float(search_frequencies[peak_index])
     peak_amplitude = float(search_amplitudes[peak_index])
     noise_floor = float(np.median(search_amplitudes))
@@ -68,8 +77,32 @@ def suggest_frequency_band_from_motion_trace(
         np.clip((peak_amplitude - noise_floor) / max(peak_amplitude, 1e-6), 0.0, 1.0)
     )
 
-    low_hz = max(min_hz, peak_hz * 0.75)
-    high_hz = min(search_max_hz, max(low_hz + 0.25, peak_hz * 2.5))
+    # Adaptive band width: expand if peak is broad or multiple peaks
+    band_peaks = [peak_index]
+    if len(peaks) > 1:
+        # If multiple significant peaks, include them in band
+        band_peaks = list(peaks)
+        min_band = float(search_frequencies[min(band_peaks)])
+        max_band = float(search_frequencies[max(band_peaks)])
+        low_hz = max(min_hz, min_band - 0.1)
+        high_hz = min(search_max_hz, max_band + 0.1)
+    else:
+        low_hz, high_hz = _estimate_band_edges_from_spectrum(
+            frequencies=search_frequencies,
+            amplitudes=search_amplitudes,
+            peak_index=peak_index,
+            min_hz=min_hz,
+            max_hz=search_max_hz,
+        )
+
+    # Clamp for low/high frequency cases
+    if peak_hz < 0.5:
+        low_hz = max(min_hz, peak_hz - 0.1)
+        high_hz = min(search_max_hz, peak_hz + 0.5)
+    elif peak_hz > nyquist * 0.7:
+        low_hz = max(min_hz, peak_hz - 0.5)
+        high_hz = min(search_max_hz, peak_hz + 0.1)
+
     return FrequencyBandSuggestion(
         low_hz=_round_band_edge(low_hz),
         high_hz=_round_band_edge(high_hz),
@@ -133,10 +166,12 @@ def analyze_source_frequency_band(
     )
     grayscale = frames.astype(np.float32) / 255.0
 
-    row_start = int(analysis_height * 0.2)
-    row_end = max(row_start + 2, int(analysis_height * 0.85))
-    column_start = int(analysis_width * 0.2)
-    column_end = max(column_start + 2, int(analysis_width * 0.8))
+    # Keep a small border trim so edge junk does not dominate, but avoid the
+    # older center-heavy crop that missed off-center motion sources.
+    row_start = int(analysis_height * 0.1)
+    row_end = max(row_start + 2, int(analysis_height * 0.9))
+    column_start = int(analysis_width * 0.1)
+    column_end = max(column_start + 2, int(analysis_width * 0.9))
     cropped = grayscale[:, row_start:row_end, column_start:column_end]
     if cropped.shape[1] < 4 or cropped.shape[2] < 4:
         return _fallback_band(probe, analysis_fps)
@@ -179,6 +214,38 @@ def _fallback_band(
         analysis_fps=analysis_fps,
         confidence=0.0,
     )
+
+
+def _estimate_band_edges_from_spectrum(
+    *,
+    frequencies: np.ndarray,
+    amplitudes: np.ndarray,
+    peak_index: int,
+    min_hz: float,
+    max_hz: float,
+) -> tuple[float, float]:
+    peak_hz = float(frequencies[peak_index])
+    peak_amplitude = float(amplitudes[peak_index])
+    low_index = peak_index
+    while low_index > 0 and float(amplitudes[low_index]) >= peak_amplitude * 0.45:
+        low_index -= 1
+    high_index = peak_index
+    while high_index < len(amplitudes) - 1 and float(amplitudes[high_index]) >= peak_amplitude * 0.45:
+        high_index += 1
+
+    low_hz = max(min_hz, float(frequencies[low_index]))
+    high_hz = min(max_hz, float(frequencies[high_index]))
+    bin_width = float(frequencies[1] - frequencies[0]) if len(frequencies) > 1 else 0.1
+    min_width = max(0.25, bin_width * 2.0)
+    max_width = max(min_width, min(max_hz - min_hz, max(0.9, peak_hz * 1.2)))
+
+    if high_hz - low_hz < min_width:
+        low_hz = max(min_hz, peak_hz - (min_width / 2.0))
+        high_hz = min(max_hz, peak_hz + (min_width / 2.0))
+    if high_hz - low_hz > max_width:
+        low_hz = max(min_hz, peak_hz - (max_width / 2.0))
+        high_hz = min(max_hz, peak_hz + (max_width / 2.0))
+    return low_hz, high_hz
 
 
 def _round_band_edge(value: float) -> float:

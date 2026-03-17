@@ -57,6 +57,8 @@ class RenderSupervisorSnapshot:
     terminal_message_type: str | None = None
     failure_classification: str | None = None
     failure_stage: str | None = None
+    failure_detail: str | None = None
+    failure_exception_type: str | None = None
     watchdog_status: str = "running"
     watchdog_classification: str | None = None
     watchdog_message: str | None = None
@@ -117,6 +119,8 @@ class RenderSupervisor:
         self._artifact_paths: dict[str, str] = {}
         self._failure_classification: str | None = None
         self._failure_stage: str | None = None
+        self._failure_detail: str | None = None
+        self._failure_exception_type: str | None = None
         self._watchdog_decision = WatchdogDecision(status="running")
         self._cancellation_requested = False
 
@@ -174,7 +178,7 @@ class RenderSupervisor:
         events: list[RenderEvent] = []
 
         self._accept_connection_if_available()
-        self._advance_handshake()
+        self._advance_handshake(now)
         events.extend(self._drain_messages(now))
         self._watchdog_decision = self._evaluate_watchdog(now)
         self._apply_terminal_decision()
@@ -200,6 +204,8 @@ class RenderSupervisor:
             terminal_message_type=terminal_message,
             failure_classification=self._failure_classification,
             failure_stage=self._failure_stage,
+            failure_detail=self._failure_detail,
+            failure_exception_type=self._failure_exception_type,
             watchdog_status=self._watchdog_decision.status,
             watchdog_classification=self._watchdog_decision.classification,
             watchdog_message=self._watchdog_decision.message,
@@ -246,7 +252,7 @@ class RenderSupervisor:
         self._connection_socket = connection_socket
         self._connection = JsonLineConnection(connection_socket)
 
-    def _advance_handshake(self) -> None:
+    def _advance_handshake(self, now: float) -> None:
         if self._connection is None or self._session is None or self._handshake_complete:
             return
 
@@ -280,6 +286,10 @@ class RenderSupervisor:
 
         self._handshake_complete = True
         self._worker_pid = ack["pid"]
+        # The watchdog needs a shell-local receipt timestamp as soon as the
+        # session is bound so a worker that goes silent immediately after the
+        # handshake still times out instead of waiting forever.
+        self._watchdog.record_telemetry(received_at=now)
 
     def _drain_messages(self, now: float) -> list[RenderEvent]:
         if self._connection is None or self._session is None or not self._handshake_complete:
@@ -332,7 +342,12 @@ class RenderSupervisor:
             return
         if message_type == "stage_started":
             self._phase = "rendering"
-            self._stage = str(payload.get("stage") or "render")
+            next_stage = str(payload.get("stage") or "render")
+            stage_changed = next_stage != self._stage
+            self._stage = next_stage
+            if stage_changed:
+                self._frames_completed = 0
+                self._progress_token = None
             if isinstance(payload.get("total_frames"), int):
                 self._total_frames = payload["total_frames"]
             return
@@ -355,6 +370,12 @@ class RenderSupervisor:
         if message_type == "failure":
             self._failure_classification = payload.get("classification")
             self._failure_stage = payload.get("stage")
+            detail = payload.get("detail")
+            exception_type = payload.get("exception_type")
+            self._failure_detail = None if detail is None else str(detail)
+            self._failure_exception_type = (
+                None if exception_type is None else str(exception_type)
+            )
             return
 
     def _evaluate_watchdog(self, now: float) -> WatchdogDecision:

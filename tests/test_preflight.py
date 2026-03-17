@@ -184,6 +184,19 @@ def test_preflight_keeps_retention_budget_separate_from_active_scratch_gate() ->
     assert all(issue.code != "active_scratch_reservation_failed" for issue in report.blockers)
 
 
+def test_preflight_does_not_treat_output_staging_as_retention_evidence() -> None:
+    budgets = _budgets(
+        retention_budget_bytes=(10 * 1024 * 1024 * 1024) + (40 * 1024 * 1024),
+        retained_evidence_bytes=10 * 1024 * 1024 * 1024,
+    )
+
+    report = run_preflight(_inputs(budgets=budgets))
+
+    assert all(
+        issue.code != "retention_budget_likely_exceeded" for issue in report.warnings
+    )
+
+
 def test_preflight_blocks_when_active_scratch_cannot_be_reserved() -> None:
     budgets = _budgets(
         available_scratch_bytes=800 * 1024 * 1024,
@@ -206,6 +219,21 @@ def test_preflight_blocks_output_upscaling() -> None:
     report = run_preflight(_inputs(intent=intent))
 
     assert any(issue.code == "output_upscale_blocked" for issue in report.blockers)
+
+
+def test_preflight_blocks_odd_output_resolution_for_current_encoder_path() -> None:
+    intent = JobIntent(
+        phase=_intent().phase,
+        processing_resolution=Resolution(width=853, height=480),
+        output_resolution=Resolution(width=853, height=480),
+        resource_policy=ResourcePolicy.BALANCED,
+    )
+
+    report = run_preflight(_inputs(intent=intent))
+
+    assert any(
+        issue.code == "output_resolution_even_required" for issue in report.blockers
+    )
 
 
 def test_preflight_blocks_when_output_volume_cannot_stage_finalization() -> None:

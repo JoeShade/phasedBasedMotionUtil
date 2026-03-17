@@ -36,6 +36,11 @@ class WatchdogState:
         self.last_child_counter: int | None = None
         self.terminal_message_type: str | None = None
 
+    def record_telemetry(self, *, received_at: float) -> None:
+        """Remember the latest shell-side receipt time even when the traffic was only the session handshake."""
+
+        self.last_telemetry_at = received_at
+
     def record_message(
         self,
         *,
@@ -45,7 +50,7 @@ class WatchdogState:
     ) -> None:
         """Record one received shell-side message."""
 
-        self.last_telemetry_at = received_at
+        self.record_telemetry(received_at=received_at)
 
         if message_type == "heartbeat":
             self.last_heartbeat_at = received_at
@@ -97,8 +102,11 @@ class WatchdogState:
                     message="Worker is alive but has not produced qualifying forward progress.",
                 )
 
-        if self.last_heartbeat_at is not None:
-            silence = now - self.last_heartbeat_at
+        silence_anchor = self.last_heartbeat_at
+        if silence_anchor is None:
+            silence_anchor = self.last_telemetry_at
+        if silence_anchor is not None:
+            silence = now - silence_anchor
             if silence > thresholds.hard_timeout_seconds:
                 return WatchdogDecision(
                     status="failed",

@@ -184,6 +184,7 @@ def test_render_worker_produces_final_mp4_and_sidecar(tmp_path: Path) -> None:
     assert request.paths.final_mp4_path.exists()
     assert request.paths.final_sidecar_path.exists()
     assert (request.paths.diagnostics_directory / "diagnostics_bundle.json").exists()
+    assert (request.paths.output_directory / "roi_metrics.csv").exists()
     validation = validate_sidecar_file(request.paths.final_sidecar_path)
     assert validation.is_valid is True
     sidecar_payload = json.loads(request.paths.final_sidecar_path.read_text(encoding="utf-8"))
@@ -201,6 +202,9 @@ def test_render_worker_produces_final_mp4_and_sidecar(tmp_path: Path) -> None:
         "height": 16,
         "fps": 12.0,
     }
+    assert sidecar_payload["results"]["analysis"]["enabled"] is True
+    assert sidecar_payload["results"]["analysis"]["status"] == "completed"
+    assert "roi_metrics" in sidecar_payload["results"]["artifact_paths"]
     bundle_payload = json.loads(
         (request.paths.diagnostics_directory / "diagnostics_bundle.json").read_text(
             encoding="utf-8"
@@ -209,6 +213,7 @@ def test_render_worker_produces_final_mp4_and_sidecar(tmp_path: Path) -> None:
     assert bundle_payload["diagnostics_cap_bytes"] == request.diagnostics_cap_bytes
     assert bundle_payload["scheduler_decisions"]["decode_pass_count"] == 2
     assert bundle_payload["intermediate_storage_policy"] == "two_pass_streaming_rgb24_batches"
+    assert "roi_metrics" in bundle_payload["artifact_paths"]
 
 
 def test_choose_codec_plan_falls_back_without_hevc_encoder(monkeypatch) -> None:
@@ -251,3 +256,115 @@ def test_worker_exception_classifier_maps_memory_error_to_out_of_memory() -> Non
         render_module._classify_worker_exception(RuntimeError("boom"))
         == "internal_processing_exception"
     )
+
+
+def test_format_worker_exception_detail_includes_type_and_message() -> None:
+    assert (
+        render_module._format_worker_exception_detail(RuntimeError("phase blew up"))
+        == "RuntimeError: phase blew up"
+    )
+    assert render_module._format_worker_exception_detail(RuntimeError()) == "RuntimeError"
+
+
+def test_describe_encode_stream_failure_includes_encoder_stderr() -> None:
+    class _FakeProcess:
+        def poll(self) -> int | None:
+            return 1
+
+    class _FakeEncoder:
+        process = _FakeProcess()
+
+        @staticmethod
+        def latest_stderr_summary() -> str | None:
+            return "width not divisible by 2 (853x480)"
+
+    detail = render_module._describe_encode_stream_failure(
+        _FakeEncoder(),
+        BrokenPipeError(32, "Broken pipe"),
+    )
+
+    assert "BrokenPipeError: [Errno 32] Broken pipe" in detail
+    assert "Encoder exit code 1" in detail
+    assert "width not divisible by 2" in detail
+
+
+def test_render_worker_reports_incremental_phase_processing_frame_progress(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.mkv"
+    _create_motion_test_video(source_path)
+    request = RenderRequest(
+        job_id="job-render-progress",
+        intent=JobIntent(
+            phase=PhaseSettings(
+                magnification=3.0,
+                low_hz=1.0,
+                high_hz=4.0,
+                pyramid_type="complex_steerable",
+                sigma=1.0,
+                attenuate_other_frequencies=True,
+            ),
+            processing_resolution=Resolution(16, 16),
+            output_resolution=Resolution(16, 16),
+            resource_policy=ResourcePolicy.CONSERVATIVE,
+            mask_feather_px=4.0,
+        ),
+        paths=RenderPaths(
+            source_path=source_path,
+            output_directory=tmp_path / "output",
+            output_stem="result",
+            scratch_directory=tmp_path / "scratch",
+            diagnostics_directory=tmp_path / "diagnostics",
+        ),
+        expected_source_fingerprint_sha256=_sha256(source_path),
+        diagnostic_level=DiagnosticLevel.BASIC,
+        diagnostics_cap_bytes=128 * 1024 * 1024,
+        retention_budget_bytes=1,
+        drift_assessment=DriftAssessment(),
+    )
+    ctx = _spawn_context()
+    cancel_event = ctx.Event()
+    session = SessionConfig(
+        session_token="token-render-progress",
+        job_id=request.job_id,
+        role="render",
+    )
+    server = open_loopback_server()
+    host, port = server.getsockname()
+    process = ctx.Process(
+        target=render_worker_process_main,
+        args=(
+            RenderWorkerConfig(
+                host=host,
+                port=port,
+                session_token=session.session_token,
+                job_id=session.job_id,
+                role=session.role,
+                request=request,
+            ),
+            cancel_event,
+        ),
+    )
+    process.start()
+
+    try:
+        connection_socket, _ = server.accept()
+        connection = JsonLineConnection(connection_socket)
+        perform_shell_handshake(connection, session)
+        messages = _drain_messages(connection, session)
+    finally:
+        process.join(timeout=60.0)
+        server.close()
+
+    frame_progress = [
+        message["payload"]["frames_completed"]
+        for message in messages
+        if message["message_type"] == "progress_update"
+        and message["payload"].get("stage") == "phase_processing"
+        and isinstance(message["payload"].get("frames_completed"), int)
+    ]
+
+    assert process.exitcode == 0
+    assert len(frame_progress) >= 2
+    assert frame_progress == sorted(frame_progress)
+    assert frame_progress[-1] == 12

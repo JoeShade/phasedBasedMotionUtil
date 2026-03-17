@@ -157,7 +157,13 @@ def test_render_supervisor_classifies_silent_exit_as_protocol_failure() -> None:
 def test_render_supervisor_surfaces_terminal_failure_payload() -> None:
     supervisor = RenderSupervisor(
         job_id="job-supervisor-failure",
-        launch_plan=_launch_plan(WorkerBehavior(mode="failure", exit_code=1)),
+        launch_plan=_launch_plan(
+            WorkerBehavior(
+                mode="failure",
+                exit_code=1,
+                failure_detail="RuntimeError: synthetic failure",
+            )
+        ),
         thresholds=_thresholds(),
         spawn_context=_spawn_context(),
     )
@@ -171,7 +177,30 @@ def test_render_supervisor_surfaces_terminal_failure_payload() -> None:
 
     assert snapshot.phase == "failed"
     assert snapshot.failure_classification == "internal_processing_exception"
+    assert snapshot.failure_detail == "RuntimeError: synthetic failure"
     assert snapshot.terminal_message_type == "failure"
+
+
+def test_render_supervisor_resets_frame_counter_when_stage_changes() -> None:
+    supervisor = RenderSupervisor(
+        job_id="job-supervisor-stage-reset",
+        launch_plan=_launch_plan(WorkerBehavior(mode="success", progress_steps=2, exit_code=0)),
+        thresholds=_thresholds(),
+        spawn_context=_spawn_context(),
+    )
+
+    supervisor._apply_message(
+        "progress_update",
+        {"stage": "decode", "frames_completed": 860, "total_frames": 860},
+    )
+    supervisor._apply_message(
+        "stage_started",
+        {"stage": "phase_processing", "total_frames": 860},
+    )
+    snapshot = supervisor.snapshot()
+
+    assert snapshot.stage == "phase_processing"
+    assert snapshot.frames_completed == 0
 
 
 def test_render_supervisor_rejects_claimed_success_with_nonzero_exit() -> None:
@@ -249,3 +278,41 @@ def test_render_supervisor_close_terminates_unresponsive_worker() -> None:
 
     assert supervisor._process is not None
     assert supervisor._process.is_alive() is False
+
+
+def test_render_supervisor_classifies_post_handshake_silence_as_unresponsive() -> None:
+    def build_config(
+        host: str,
+        port: int,
+        session_token: str,
+        job_id: str,
+        role: str,
+    ) -> _StubbornWorkerConfig:
+        return _StubbornWorkerConfig(
+            host=host,
+            port=port,
+            session_token=session_token,
+            job_id=job_id,
+            role=role,
+        )
+
+    supervisor = RenderSupervisor(
+        job_id="job-supervisor-unresponsive",
+        launch_plan=WorkerLaunchPlan(
+            role="render",
+            target=_stubborn_worker_main,
+            config_factory=build_config,
+        ),
+        thresholds=_thresholds(),
+        spawn_context=_spawn_context(),
+    )
+
+    try:
+        supervisor.start()
+        _poll_until_terminal(supervisor, timeout_seconds=2.0)
+        snapshot = supervisor.snapshot()
+    finally:
+        supervisor.close()
+
+    assert snapshot.phase == "failed"
+    assert snapshot.failure_classification == "worker_unresponsive"

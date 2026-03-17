@@ -107,6 +107,10 @@ def test_sidecar_schema_validation_accepts_valid_document() -> None:
 
 def test_sidecar_schema_validation_accepts_normalization_metadata(tmp_path) -> None:
     sidecar = _valid_sidecar()
+    sidecar["results"]["preflight"]["source_is_cfr"] = False
+    sidecar["results"]["diagnostics_summary"]["normalized_source_path"] = (
+        "A:/scratch/working-source.mkv"
+    )
     sidecar["results"]["preflight"]["working_fps"] = 59.94
     sidecar["results"]["preflight"]["working_source_resolution"] = {
         "width": 1440,
@@ -129,6 +133,65 @@ def test_sidecar_schema_validation_accepts_normalization_metadata(tmp_path) -> N
     document = load_sidecar_document(sidecar_path)
     assert document.results.preflight.working_fps == 59.94
     assert document.results.preflight.working_source_resolution.width == 1440
+
+
+def test_sidecar_schema_validation_rejects_missing_normalization_metadata() -> None:
+    sidecar = _valid_sidecar()
+    sidecar["results"]["preflight"]["source_is_cfr"] = False
+    sidecar["results"]["diagnostics_summary"]["normalized_source_path"] = (
+        "A:/scratch/working-source.mkv"
+    )
+
+    validation = validate_sidecar_data(sidecar)
+
+    assert validation.status == "invalid"
+    assert any("working_fps" in error for error in validation.errors)
+    assert any("working_source_resolution" in error for error in validation.errors)
+    assert any("normalization_steps" in error for error in validation.errors)
+
+
+def test_sidecar_schema_validation_accepts_quantitative_analysis_metadata() -> None:
+    sidecar = _valid_sidecar()
+    sidecar["intent"]["analysis"] = {
+        "enabled": True,
+        "roi": None,
+        "minimum_cell_support_fraction": 0.35,
+        "roi_quality_cutoff": 0.45,
+        "low_confidence_threshold": 0.35,
+        "auto_band_count": 5,
+        "band_mode": "auto",
+        "manual_bands": [],
+        "export_advanced_files": True,
+    }
+    sidecar["results"]["analysis"] = {
+        "enabled": True,
+        "status": "completed",
+        "roi_mode": "whole_frame",
+        "roi_label": "Whole-frame ROI",
+        "reported_peaks": [],
+        "bands": [],
+        "artifact_paths": {"roi_metrics": "A:/out/roi_metrics.csv"},
+        "warnings": [],
+        "cell_rejection_stats": {
+            "valid_cell_count": 4,
+            "rejected_cell_count": 1,
+            "rejection_penalty_contribution": 0.2,
+        },
+        "auto_band_merge_steps": [],
+        "suppressed_peak_reasons": [],
+        "heatmap_scale": {
+            "normalization_method": "robust_percentile",
+            "lower_percentile": 5.0,
+            "upper_percentile": 95.0,
+            "display_min": 0.0,
+            "display_max": 0.8,
+            "clipped_cell_count": 2,
+        },
+    }
+
+    validation = validate_sidecar_data(sidecar)
+
+    assert validation.status == "valid"
 
 
 def test_sidecar_schema_validation_rejects_malformed_output_details() -> None:
@@ -283,7 +346,7 @@ def test_sidecar_schema_validation_accepts_older_version_without_zone_mode() -> 
 
 def test_sidecar_schema_validation_rejects_newer_minor_version() -> None:
     sidecar = _valid_sidecar()
-    sidecar["schema_version"] = "1.3.0"
+    sidecar["schema_version"] = "1.4.0"
 
     validation = validate_sidecar_data(sidecar)
 

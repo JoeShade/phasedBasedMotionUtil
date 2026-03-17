@@ -12,11 +12,12 @@ from jsonschema import Draft202012Validator
 
 from phase_motion_app.core.models import JobIntent, SidecarDocument
 
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
 _SEMVER_PATTERN = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
 _SUPPORTED_OLDER_SCHEMA_VERSIONS = {
     "1.0.0": "schema_version 1.0.0 was accepted through the explicit compatibility path.",
     "1.1.0": "schema_version 1.1.0 was accepted through the explicit compatibility path.",
+    "1.2.0": "schema_version 1.2.0 was accepted through the explicit compatibility path.",
 }
 
 # The design doc defines the domains and required safety checks, but it does not
@@ -78,6 +79,59 @@ SIDECAR_SCHEMA_V1: dict[str, Any] = {
                     "items": {"$ref": "#/$defs/exclusion_zone"},
                 },
                 "mask_feather_px": {"type": "number", "exclusiveMinimum": 0},
+                "analysis": {
+                    "type": "object",
+                    "required": [
+                        "enabled",
+                        "minimum_cell_support_fraction",
+                        "roi_quality_cutoff",
+                        "low_confidence_threshold",
+                        "auto_band_count",
+                        "band_mode",
+                        "manual_bands",
+                        "export_advanced_files",
+                    ],
+                    "additionalProperties": False,
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "roi": {
+                            "anyOf": [
+                                {"type": "null"},
+                                {"$ref": "#/$defs/exclusion_zone"},
+                            ]
+                        },
+                        "minimum_cell_support_fraction": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                            "maximum": 1,
+                        },
+                        "roi_quality_cutoff": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                        "low_confidence_threshold": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                        "auto_band_count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 5,
+                        },
+                        "band_mode": {
+                            "type": "string",
+                            "enum": ["auto", "manual_single", "manual_multi"],
+                        },
+                        "manual_bands": {
+                            "type": "array",
+                            "maxItems": 5,
+                            "items": {"$ref": "#/$defs/analysis_band"},
+                        },
+                        "export_advanced_files": {"type": "boolean"},
+                    },
+                },
                 "output_container": {"type": "string", "const": "mp4"},
                 "requested_output_codec": {"type": "string", "minLength": 1},
             },
@@ -217,6 +271,85 @@ SIDECAR_SCHEMA_V1: dict[str, Any] = {
                         },
                     },
                 },
+                "analysis": {
+                    "type": "object",
+                    "required": [
+                        "enabled",
+                        "status",
+                        "roi_mode",
+                        "roi_label",
+                        "reported_peaks",
+                        "bands",
+                        "artifact_paths",
+                        "warnings",
+                        "cell_rejection_stats",
+                        "auto_band_merge_steps",
+                        "suppressed_peak_reasons",
+                    ],
+                    "additionalProperties": False,
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["disabled", "completed", "warning"],
+                        },
+                        "roi_mode": {
+                            "type": "string",
+                            "enum": ["manual", "whole_frame"],
+                        },
+                        "roi_label": {"type": "string", "minLength": 1},
+                        "roi_geometry": {
+                            "anyOf": [
+                                {"type": "null"},
+                                {"$ref": "#/$defs/exclusion_zone"},
+                            ]
+                        },
+                        "roi_quality_score": {"type": "number", "minimum": 0, "maximum": 1},
+                        "confidence_label": {"type": "string", "minLength": 1},
+                        "reported_peaks": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/reported_peak"},
+                        },
+                        "bands": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/generated_band"},
+                        },
+                        "artifact_paths": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                        },
+                        "warnings": {"type": "array", "items": {"type": "string"}},
+                        "cell_rejection_stats": {"type": "object"},
+                        "auto_band_merge_steps": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "suppressed_peak_reasons": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "heatmap_scale": {
+                            "type": "object",
+                            "required": [
+                                "normalization_method",
+                                "lower_percentile",
+                                "upper_percentile",
+                                "display_min",
+                                "display_max",
+                                "clipped_cell_count",
+                            ],
+                            "additionalProperties": False,
+                            "properties": {
+                                "normalization_method": {"type": "string", "minLength": 1},
+                                "lower_percentile": {"type": "number", "minimum": 0, "maximum": 100},
+                                "upper_percentile": {"type": "number", "minimum": 0, "maximum": 100},
+                                "display_min": {"type": "number", "minimum": 0},
+                                "display_max": {"type": "number", "minimum": 0},
+                                "clipped_cell_count": {"type": "integer", "minimum": 0},
+                            },
+                        },
+                    },
+                },
                 "drift_acknowledgement": {
                     "type": "object",
                     "required": [
@@ -271,6 +404,47 @@ SIDECAR_SCHEMA_V1: dict[str, Any] = {
                     "then": {"required": ["radius"]},
                 },
             ],
+        },
+        "analysis_band": {
+            "type": "object",
+            "required": ["band_id", "low_hz", "high_hz"],
+            "additionalProperties": False,
+            "properties": {
+                "band_id": {"type": "string", "minLength": 1},
+                "low_hz": {"type": "number", "exclusiveMinimum": 0},
+                "high_hz": {"type": "number", "exclusiveMinimum": 0},
+            },
+        },
+        "reported_peak": {
+            "type": "object",
+            "required": [
+                "frequency_hz",
+                "amplitude",
+                "support_fraction",
+                "ranking_score",
+            ],
+            "additionalProperties": False,
+            "properties": {
+                "frequency_hz": {"type": "number", "exclusiveMinimum": 0},
+                "amplitude": {"type": "number", "minimum": 0},
+                "support_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+                "ranking_score": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+        },
+        "generated_band": {
+            "type": "object",
+            "required": ["band_id", "low_hz", "high_hz", "mode"],
+            "additionalProperties": False,
+            "properties": {
+                "band_id": {"type": "string", "minLength": 1},
+                "low_hz": {"type": "number", "exclusiveMinimum": 0},
+                "high_hz": {"type": "number", "exclusiveMinimum": 0},
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "manual_single", "manual_multi"],
+                },
+                "source_peak_hz": {"type": ["number", "null"], "exclusiveMinimum": 0},
+            },
         },
     },
 }
@@ -329,6 +503,28 @@ def _semantic_validation_errors(data: dict[str, Any]) -> list[str]:
             "intent.phase.high_hz: high_hz must be greater than low_hz for a valid exported intent."
         )
 
+    analysis = intent.get("analysis")
+    if analysis is not None:
+        manual_bands = analysis.get("manual_bands", [])
+        if len(manual_bands) > 5:
+            errors.append(
+                "intent.analysis.manual_bands: at most five manual bands are allowed."
+            )
+        for index, band in enumerate(manual_bands):
+            if band["high_hz"] <= band["low_hz"]:
+                errors.append(
+                    f"intent.analysis.manual_bands.{index}.high_hz: high_hz must be greater than low_hz."
+                )
+        band_mode = analysis.get("band_mode")
+        if band_mode == "manual_single" and len(manual_bands) < 1:
+            errors.append(
+                "intent.analysis.manual_bands: manual_single mode requires one manual band."
+            )
+        if band_mode == "manual_multi" and len(manual_bands) < 1:
+            errors.append(
+                "intent.analysis.manual_bands: manual_multi mode requires at least one manual band."
+            )
+
     if (
         output_resolution["width"] > processing_resolution["width"]
         or output_resolution["height"] > processing_resolution["height"]
@@ -346,6 +542,30 @@ def _semantic_validation_errors(data: dict[str, Any]) -> list[str]:
         ):
             errors.append(
                 "results.drift_acknowledgement.reviewed_source_fingerprint_sha256: drift acknowledgement must match the rendered source fingerprint."
+            )
+
+    results = data["results"]
+    preflight = results["preflight"]
+    diagnostics_summary = results.get("diagnostics_summary", {})
+    normalized_source_path = diagnostics_summary.get("normalized_source_path")
+    normalization_steps = preflight.get("normalization_steps") or []
+    normalization_metadata_required = (
+        preflight.get("source_is_cfr") is False
+        or normalized_source_path not in (None, "")
+        or bool(normalization_steps)
+    )
+    if normalization_metadata_required:
+        if preflight.get("working_fps") is None:
+            errors.append(
+                "results.preflight.working_fps: normalization metadata must record the working FPS when a derived working source was used."
+            )
+        if preflight.get("working_source_resolution") is None:
+            errors.append(
+                "results.preflight.working_source_resolution: normalization metadata must record the working source resolution when a derived working source was used."
+            )
+        if not normalization_steps:
+            errors.append(
+                "results.preflight.normalization_steps: normalization metadata must record the applied normalization steps when a derived working source was used."
             )
 
     return errors

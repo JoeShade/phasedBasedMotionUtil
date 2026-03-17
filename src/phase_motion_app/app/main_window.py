@@ -7,6 +7,7 @@ import json
 import shutil
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ import psutil
 from PyQt6.QtCore import QThread, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QDesktopServices, QImage, QPixmap
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -37,7 +39,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from phase_motion_app.app.drift_editor import DriftEditorDialog
+from phase_motion_app.app.drift_editor import AnalysisRoiEditorDialog, DriftEditorDialog
 from phase_motion_app.app.terminal_outcome import TerminalOutcomeData, TerminalOutcomeDialog
 from phase_motion_app.core.baseline_band import (
     FrequencyBandSuggestion,
@@ -50,10 +52,17 @@ from phase_motion_app.core.job_state import (
     SingleJobController,
     SourceSnapshot,
     UiState,
+    detect_stale_source,
 )
-from phase_motion_app.core.masking import validate_exclusion_zones
+from phase_motion_app.core.masking import (
+    summarize_automatic_analysis_roi,
+    validate_exclusion_zones,
+)
 from phase_motion_app.core.media_tools import extract_first_frame, extract_last_frame
 from phase_motion_app.core.models import (
+    AnalysisBand,
+    AnalysisBandMode,
+    AnalysisSettings,
     DiagnosticLevel,
     JobIntent,
     PhaseSettings,
@@ -145,6 +154,24 @@ def _resolution_options_for_source(
         seen.add(key)
         options.append(Resolution(width=width, height=height))
     return tuple(options)
+
+
+def _codec_safe_output_resolution(
+    resolution: Resolution,
+    *,
+    processing_resolution: Resolution,
+) -> Resolution | None:
+    """Clamp output geometry to the current 4:2:0 encoder requirements without ever upscaling."""
+
+    width = min(resolution.width, processing_resolution.width)
+    height = min(resolution.height, processing_resolution.height)
+    if width > 1 and width % 2 != 0:
+        width -= 1
+    if height > 1 and height % 2 != 0:
+        height -= 1
+    if width <= 0 or height <= 0:
+        return None
+    return Resolution(width=width, height=height)
 
 
 class FingerprintWorker(QThread):
@@ -344,6 +371,157 @@ class PreflightWarningDialog(QDialog):
         layout.addWidget(buttons)
 
 
+@dataclass(frozen=True)
+class AnalysisAdvancedDialogResult:
+    """This result object returns the advanced analysis controls without pushing diagnostics settings through the same UI path."""
+
+    minimum_cell_support_fraction: float
+    roi_quality_cutoff: float
+    low_confidence_threshold: float
+    auto_band_count: int
+    export_advanced_files: bool
+    manual_band_values: tuple[tuple[bool, float, float], ...]
+
+
+class AnalysisAdvancedDialog(QDialog):
+    """This dialog keeps the detailed quantitative-analysis knobs out of the main instrument surface while preserving the existing validation model."""
+
+    def __init__(
+        self,
+        *,
+        band_mode: AnalysisBandMode,
+        minimum_cell_support_fraction: float,
+        roi_quality_cutoff: float,
+        low_confidence_threshold: float,
+        auto_band_count: int,
+        export_advanced_files: bool,
+        manual_band_values: tuple[tuple[bool, float, float], ...],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._band_mode = band_mode
+        self.setWindowTitle("Advanced Analysis")
+        self.resize(560, 420)
+
+        layout = QVBoxLayout(self)
+        summary_label = QLabel(
+            "Band mode is chosen on the main screen. Use this popout for advanced analysis thresholds, export options, and manual band values."
+        )
+        summary_label.setWordWrap(True)
+        mode_label = QLabel(f"Current band mode: {self._band_mode.value.replace('_', ' ')}")
+        mode_label.setWordWrap(True)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self.analysis_support_spin = QDoubleSpinBox()
+        self.analysis_support_spin.setDecimals(2)
+        self.analysis_support_spin.setRange(0.05, 1.0)
+        self.analysis_support_spin.setSingleStep(0.05)
+        self.analysis_support_spin.setValue(minimum_cell_support_fraction)
+        self.analysis_quality_cutoff_spin = QDoubleSpinBox()
+        self.analysis_quality_cutoff_spin.setDecimals(2)
+        self.analysis_quality_cutoff_spin.setRange(0.0, 1.0)
+        self.analysis_quality_cutoff_spin.setSingleStep(0.05)
+        self.analysis_quality_cutoff_spin.setValue(roi_quality_cutoff)
+        self.analysis_low_confidence_spin = QDoubleSpinBox()
+        self.analysis_low_confidence_spin.setDecimals(2)
+        self.analysis_low_confidence_spin.setRange(0.0, 1.0)
+        self.analysis_low_confidence_spin.setSingleStep(0.05)
+        self.analysis_low_confidence_spin.setValue(low_confidence_threshold)
+        self.analysis_auto_band_count_spin = QSpinBox()
+        self.analysis_auto_band_count_spin.setRange(1, 5)
+        self.analysis_auto_band_count_spin.setValue(auto_band_count)
+        self.analysis_export_advanced_checkbox = QCheckBox(
+            "Export advanced/internal analysis files"
+        )
+        self.analysis_export_advanced_checkbox.setChecked(export_advanced_files)
+
+        self._manual_band_controls: list[tuple[QCheckBox, QDoubleSpinBox, QDoubleSpinBox]] = []
+        self._manual_band_container = QWidget(self)
+        manual_band_layout = QVBoxLayout(self._manual_band_container)
+        manual_band_layout.setContentsMargins(0, 0, 0, 0)
+        manual_band_layout.setSpacing(4)
+        band_defaults = manual_band_values or tuple(
+            (index == 0, 5.0 + index, 12.0 + index) for index in range(5)
+        )
+        for band_index in range(5):
+            enabled, low_hz, high_hz = band_defaults[band_index]
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            enabled_check = QCheckBox(f"Band {band_index + 1}")
+            enabled_check.setChecked(enabled)
+            low_spin = QDoubleSpinBox()
+            low_spin.setDecimals(3)
+            low_spin.setRange(0.001, 1000.0)
+            low_spin.setValue(low_hz)
+            low_spin.setSuffix(" Hz")
+            high_spin = QDoubleSpinBox()
+            high_spin.setDecimals(3)
+            high_spin.setRange(0.001, 1000.0)
+            high_spin.setValue(high_hz)
+            high_spin.setSuffix(" Hz")
+            row_layout.addWidget(enabled_check)
+            row_layout.addWidget(QLabel("Low"))
+            row_layout.addWidget(low_spin)
+            row_layout.addWidget(QLabel("High"))
+            row_layout.addWidget(high_spin)
+            manual_band_layout.addWidget(row)
+            self._manual_band_controls.append((enabled_check, low_spin, high_spin))
+            enabled_check.toggled.connect(self._sync_band_controls)
+
+        form.addRow("Minimum cell support", self.analysis_support_spin)
+        form.addRow("ROI quality cutoff", self.analysis_quality_cutoff_spin)
+        form.addRow("Low-confidence threshold", self.analysis_low_confidence_spin)
+        form.addRow("Auto-band count", self.analysis_auto_band_count_spin)
+        form.addRow("", self.analysis_export_advanced_checkbox)
+        form.addRow("Manual bands", self._manual_band_container)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout.addWidget(summary_label)
+        layout.addWidget(mode_label)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self._sync_band_controls()
+
+    def _sync_band_controls(self) -> None:
+        auto_mode = self._band_mode is AnalysisBandMode.AUTO
+        self.analysis_auto_band_count_spin.setEnabled(auto_mode)
+        for index, (enabled_check, low_spin, high_spin) in enumerate(self._manual_band_controls):
+            band_enabled = not auto_mode and (
+                self._band_mode is AnalysisBandMode.MANUAL_MULTI
+                or (
+                    self._band_mode is AnalysisBandMode.MANUAL_SINGLE
+                    and index == 0
+                )
+            )
+            enabled_check.setEnabled(band_enabled)
+            low_spin.setEnabled(band_enabled and enabled_check.isChecked())
+            high_spin.setEnabled(band_enabled and enabled_check.isChecked())
+
+    def result_data(self) -> AnalysisAdvancedDialogResult:
+        return AnalysisAdvancedDialogResult(
+            minimum_cell_support_fraction=float(self.analysis_support_spin.value()),
+            roi_quality_cutoff=float(self.analysis_quality_cutoff_spin.value()),
+            low_confidence_threshold=float(self.analysis_low_confidence_spin.value()),
+            auto_band_count=int(self.analysis_auto_band_count_spin.value()),
+            export_advanced_files=self.analysis_export_advanced_checkbox.isChecked(),
+            manual_band_values=tuple(
+                (
+                    enabled_check.isChecked(),
+                    float(low_spin.value()),
+                    float(high_spin.value()),
+                )
+                for enabled_check, low_spin, high_spin in self._manual_band_controls
+            ),
+        )
+
+
 class MainWindow(QMainWindow):
     """This window is a thin shell over the tested core services and intentionally avoids running heavy work in the GUI thread."""
 
@@ -386,6 +564,7 @@ class MainWindow(QMainWindow):
         self._applying_suggested_band = False
         self._exclusion_zones = ()
         self._mask_feather_px = 4.0
+        self._analysis_roi = None
         self._drift_assessment = DriftAssessment()
         self._render_supervisor: Any | None = None
         self._active_render_request: RenderRequest | None = None
@@ -405,6 +584,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_persisted_state()
         self._wire_signals()
+        self._update_analysis_controls()
         self._refresh_state()
 
         self._stale_timer = QTimer(self)
@@ -528,9 +708,107 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("", self.upscale_note)
         settings_layout.addRow("Mask editor", self.exclusion_editor_button)
 
-        advanced_group = QGroupBox("Advanced and Diagnostics")
+        analysis_group = QGroupBox("Analysis")
+        analysis_layout = QFormLayout(analysis_group)
+        analysis_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        self.analysis_enabled_checkbox = QCheckBox("Enable quantitative analysis")
+        self.analysis_enabled_checkbox.setChecked(True)
+        self.analysis_roi_label = QLabel(summarize_automatic_analysis_roi(()))
+        self.analysis_roi_label.setWordWrap(True)
+        self.analysis_roi_button = QPushButton("Edit Analysis ROI")
+        self.analysis_roi_button.setEnabled(False)
+        self.analysis_band_mode_combo = QComboBox()
+        self.analysis_band_mode_combo.addItem("Auto-bands", AnalysisBandMode.AUTO)
+        self.analysis_band_mode_combo.addItem(
+            "Manual single band", AnalysisBandMode.MANUAL_SINGLE
+        )
+        self.analysis_band_mode_combo.addItem(
+            "Manual multiple bands", AnalysisBandMode.MANUAL_MULTI
+        )
+        self.analysis_band_summary_label = QLabel("Auto-bands will be generated from the ROI spectrum.")
+        self.analysis_band_summary_label.setWordWrap(True)
+        self.analysis_advanced_summary_label = QLabel(
+            "Auto-bands up to 5, support 0.35, ROI quality 0.45, low-confidence 0.35."
+        )
+        self.analysis_advanced_summary_label.setWordWrap(True)
+        self.analysis_advanced_button = QPushButton("Advanced Analysis...")
+        analysis_layout.addRow("", self.analysis_enabled_checkbox)
+        analysis_layout.addRow("ROI", self.analysis_roi_label)
+        analysis_layout.addRow("", self.analysis_roi_button)
+        analysis_layout.addRow("Band mode", self.analysis_band_mode_combo)
+        analysis_layout.addRow("Band summary", self.analysis_band_summary_label)
+        analysis_layout.addRow("Advanced summary", self.analysis_advanced_summary_label)
+        analysis_layout.addRow("", self.analysis_advanced_button)
+
+        advanced_group = QGroupBox("Advanced")
         advanced_layout = QFormLayout(advanced_group)
         advanced_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        self.retention_budget_gb_spin = QSpinBox()
+        self.retention_budget_gb_spin.setRange(1, 1000)
+        self.retention_budget_gb_spin.setValue(50)
+
+        self.analysis_support_spin = QDoubleSpinBox()
+        self.analysis_support_spin.setDecimals(2)
+        self.analysis_support_spin.setRange(0.05, 1.0)
+        self.analysis_support_spin.setSingleStep(0.05)
+        self.analysis_support_spin.setValue(0.35)
+        self.analysis_quality_cutoff_spin = QDoubleSpinBox()
+        self.analysis_quality_cutoff_spin.setDecimals(2)
+        self.analysis_quality_cutoff_spin.setRange(0.0, 1.0)
+        self.analysis_quality_cutoff_spin.setSingleStep(0.05)
+        self.analysis_quality_cutoff_spin.setValue(0.45)
+        self.analysis_low_confidence_spin = QDoubleSpinBox()
+        self.analysis_low_confidence_spin.setDecimals(2)
+        self.analysis_low_confidence_spin.setRange(0.0, 1.0)
+        self.analysis_low_confidence_spin.setSingleStep(0.05)
+        self.analysis_low_confidence_spin.setValue(0.35)
+        self.analysis_auto_band_count_spin = QSpinBox()
+        self.analysis_auto_band_count_spin.setRange(1, 5)
+        self.analysis_auto_band_count_spin.setValue(5)
+        self.analysis_export_advanced_checkbox = QCheckBox("Export advanced/internal analysis files")
+        self.analysis_export_advanced_checkbox.setChecked(True)
+        self._manual_band_controls: list[tuple[QCheckBox, QDoubleSpinBox, QDoubleSpinBox]] = []
+        self._analysis_manual_band_container = QWidget(self)
+        # This container exists only to keep the manual-band controls alive
+        # between popout dialog sessions. It must stay hidden on the main shell.
+        self._analysis_manual_band_container.hide()
+        manual_band_layout = QVBoxLayout(self._analysis_manual_band_container)
+        manual_band_layout.setContentsMargins(0, 0, 0, 0)
+        manual_band_layout.setSpacing(4)
+        for band_index in range(5):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            enabled_check = QCheckBox(f"Band {band_index + 1}")
+            enabled_check.setChecked(band_index == 0)
+            low_spin = QDoubleSpinBox()
+            low_spin.setDecimals(3)
+            low_spin.setRange(0.001, 1000.0)
+            low_spin.setValue(5.0 + band_index)
+            low_spin.setSuffix(" Hz")
+            high_spin = QDoubleSpinBox()
+            high_spin.setDecimals(3)
+            high_spin.setRange(0.001, 1000.0)
+            high_spin.setValue(12.0 + band_index)
+            high_spin.setSuffix(" Hz")
+            row_layout.addWidget(enabled_check)
+            row_layout.addWidget(QLabel("Low"))
+            row_layout.addWidget(low_spin)
+            row_layout.addWidget(QLabel("High"))
+            row_layout.addWidget(high_spin)
+            manual_band_layout.addWidget(row)
+            self._manual_band_controls.append((enabled_check, low_spin, high_spin))
+        self.dry_run_button = QPushButton("Dry-run Validation")
+        advanced_layout.addRow("Retention budget (GB)", self.retention_budget_gb_spin)
+        advanced_layout.addRow("Validation", self.dry_run_button)
+
+        diagnostics_group = QGroupBox("Diagnostics")
+        diagnostics_layout = QFormLayout(diagnostics_group)
+        diagnostics_layout.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
         )
         self.diagnostic_level_combo = QComboBox()
@@ -538,14 +816,8 @@ class MainWindow(QMainWindow):
         self.diagnostics_cap_mb_spin = QSpinBox()
         self.diagnostics_cap_mb_spin.setRange(64, 4096)
         self.diagnostics_cap_mb_spin.setValue(1024)
-        self.retention_budget_gb_spin = QSpinBox()
-        self.retention_budget_gb_spin.setRange(1, 1000)
-        self.retention_budget_gb_spin.setValue(50)
-        self.dry_run_button = QPushButton("Dry-run Validation")
-        advanced_layout.addRow("Diagnostics level", self.diagnostic_level_combo)
-        advanced_layout.addRow("Diagnostics cap (MB)", self.diagnostics_cap_mb_spin)
-        advanced_layout.addRow("Retention budget (GB)", self.retention_budget_gb_spin)
-        advanced_layout.addRow("Validation", self.dry_run_button)
+        diagnostics_layout.addRow("Diagnostics level", self.diagnostic_level_combo)
+        diagnostics_layout.addRow("Diagnostics cap (MB)", self.diagnostics_cap_mb_spin)
 
         status_group = QGroupBox("Status")
         status_layout = QFormLayout(status_group)
@@ -627,7 +899,9 @@ class MainWindow(QMainWindow):
 
         scroll_layout.addWidget(source_group)
         scroll_layout.addWidget(settings_group)
+        scroll_layout.addWidget(analysis_group)
         scroll_layout.addWidget(advanced_group)
+        scroll_layout.addWidget(diagnostics_group)
         scroll_layout.addWidget(status_group)
         scroll_layout.addWidget(report_group)
         scroll_layout.addStretch(1)
@@ -651,6 +925,22 @@ class MainWindow(QMainWindow):
         self.high_hz_spin.valueChanged.connect(self._mark_band_edited)
         self.low_hz_spin.valueChanged.connect(self._update_settings_state)
         self.high_hz_spin.valueChanged.connect(self._update_settings_state)
+        self.analysis_enabled_checkbox.toggled.connect(self._update_settings_state)
+        self.analysis_enabled_checkbox.toggled.connect(self._update_analysis_controls)
+        self.analysis_band_mode_combo.currentIndexChanged.connect(self._update_settings_state)
+        self.analysis_band_mode_combo.currentIndexChanged.connect(self._update_analysis_controls)
+        self.analysis_roi_button.clicked.connect(self._open_analysis_roi_editor)
+        self.analysis_advanced_button.clicked.connect(self._open_analysis_advanced_dialog)
+        self.analysis_support_spin.valueChanged.connect(self._update_settings_state)
+        self.analysis_quality_cutoff_spin.valueChanged.connect(self._update_settings_state)
+        self.analysis_low_confidence_spin.valueChanged.connect(self._update_settings_state)
+        self.analysis_auto_band_count_spin.valueChanged.connect(self._update_settings_state)
+        self.analysis_export_advanced_checkbox.toggled.connect(self._update_settings_state)
+        for enabled_check, low_spin, high_spin in self._manual_band_controls:
+            enabled_check.toggled.connect(self._update_settings_state)
+            enabled_check.toggled.connect(self._update_analysis_controls)
+            low_spin.valueChanged.connect(self._update_settings_state)
+            high_spin.valueChanged.connect(self._update_settings_state)
         self.resource_policy_combo.currentIndexChanged.connect(self._update_settings_state)
         self.apply_suggested_band_button.clicked.connect(self._apply_suggested_band)
         self.exclusion_editor_button.clicked.connect(self._open_drift_editor)
@@ -704,6 +994,7 @@ class MainWindow(QMainWindow):
         self._band_user_edited = False
         self._exclusion_zones = ()
         self._mask_feather_px = 4.0
+        self._analysis_roi = None
         self._drift_assessment = DriftAssessment()
         self._last_terminal_snapshot = None
         self.source_metadata_label.setText("Probe pending...")
@@ -957,13 +1248,24 @@ class MainWindow(QMainWindow):
         self.output_resolution_combo.blockSignals(True)
         self.output_resolution_combo.clear()
         if processing is not None:
+            seen: set[tuple[int, int]] = set()
             for resolution in self._resolution_options:
                 if (
                     resolution.width <= processing.width
                     and resolution.height <= processing.height
                 ):
-                    label = f"{resolution.width} x {resolution.height}"
-                    self.output_resolution_combo.addItem(label, resolution)
+                    output_resolution = _codec_safe_output_resolution(
+                        resolution,
+                        processing_resolution=processing,
+                    )
+                    if output_resolution is None:
+                        continue
+                    key = (output_resolution.width, output_resolution.height)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    label = f"{output_resolution.width} x {output_resolution.height}"
+                    self.output_resolution_combo.addItem(label, output_resolution)
         if previous_output is not None:
             previous_index = self._find_resolution_index(
                 self.output_resolution_combo, previous_output
@@ -1016,6 +1318,49 @@ class MainWindow(QMainWindow):
             return plan.working_resolution
         return None
 
+    def _build_manual_analysis_bands(self) -> tuple[AnalysisBand, ...]:
+        manual_bands: list[AnalysisBand] = []
+        band_mode = self.analysis_band_mode_combo.currentData()
+        for band_index, (enabled_check, low_spin, high_spin) in enumerate(
+            self._manual_band_controls,
+            start=1,
+        ):
+            if not enabled_check.isChecked():
+                continue
+            if band_mode is AnalysisBandMode.MANUAL_SINGLE and band_index > 1:
+                continue
+            manual_bands.append(
+                AnalysisBand(
+                    band_id=f"band{band_index:02d}",
+                    low_hz=float(low_spin.value()),
+                    high_hz=float(high_spin.value()),
+                )
+            )
+        return tuple(manual_bands)
+
+    def _current_manual_band_values(self) -> tuple[tuple[bool, float, float], ...]:
+        return tuple(
+            (
+                enabled_check.isChecked(),
+                float(low_spin.value()),
+                float(high_spin.value()),
+            )
+            for enabled_check, low_spin, high_spin in self._manual_band_controls
+        )
+
+    def _build_analysis_settings(self) -> AnalysisSettings:
+        return AnalysisSettings(
+            enabled=self.analysis_enabled_checkbox.isChecked(),
+            roi=self._analysis_roi,
+            minimum_cell_support_fraction=float(self.analysis_support_spin.value()),
+            roi_quality_cutoff=float(self.analysis_quality_cutoff_spin.value()),
+            low_confidence_threshold=float(self.analysis_low_confidence_spin.value()),
+            auto_band_count=int(self.analysis_auto_band_count_spin.value()),
+            band_mode=self.analysis_band_mode_combo.currentData(),
+            manual_bands=self._build_manual_analysis_bands(),
+            export_advanced_files=self.analysis_export_advanced_checkbox.isChecked(),
+        )
+
     def _build_intent(self) -> JobIntent:
         return JobIntent(
             phase=PhaseSettings(
@@ -1031,6 +1376,7 @@ class MainWindow(QMainWindow):
             resource_policy=self.resource_policy_combo.currentData(),
             exclusion_zones=self._exclusion_zones,
             mask_feather_px=self._mask_feather_px,
+            analysis=self._build_analysis_settings(),
         )
 
     def _find_resolution_index(
@@ -1045,6 +1391,110 @@ class MainWindow(QMainWindow):
             ):
                 return index
         return -1
+
+    def _analysis_settings_valid(self, intent: JobIntent) -> bool:
+        if not intent.analysis.enabled:
+            return True
+        if not (0.0 <= intent.analysis.roi_quality_cutoff <= 1.0):
+            return False
+        if not (0.0 <= intent.analysis.low_confidence_threshold <= 1.0):
+            return False
+        if not (0.0 < intent.analysis.minimum_cell_support_fraction <= 1.0):
+            return False
+        if not (1 <= intent.analysis.auto_band_count <= 5):
+            return False
+        if intent.analysis.band_mode is AnalysisBandMode.AUTO:
+            return True
+        if not intent.analysis.manual_bands:
+            return False
+        if (
+            intent.analysis.band_mode is AnalysisBandMode.MANUAL_SINGLE
+            and len(intent.analysis.manual_bands) != 1
+        ):
+            return False
+        if (
+            intent.analysis.band_mode is AnalysisBandMode.MANUAL_MULTI
+            and len(intent.analysis.manual_bands) > 5
+        ):
+            return False
+        for band in intent.analysis.manual_bands:
+            if band.high_hz <= band.low_hz:
+                return False
+            if band.low_hz < intent.phase.low_hz or band.high_hz > intent.phase.high_hz:
+                return False
+        return True
+
+    def _analysis_roi_summary(self) -> str:
+        if self._analysis_roi is None:
+            return summarize_automatic_analysis_roi(self._exclusion_zones)
+        if self._analysis_roi.shape.name == "RECTANGLE":
+            return (
+                f"Manual rectangle ROI at ({self._analysis_roi.x:.1f}, {self._analysis_roi.y:.1f}) "
+                f"with {(self._analysis_roi.width or 0.0):.1f} x {(self._analysis_roi.height or 0.0):.1f} px."
+            )
+        return (
+            f"Manual circle ROI centered at ({self._analysis_roi.x:.1f}, {self._analysis_roi.y:.1f}) "
+            f"with radius {(self._analysis_roi.radius or 0.0):.1f} px."
+        )
+
+    def _update_analysis_controls(self) -> None:
+        analysis_enabled = self.analysis_enabled_checkbox.isChecked()
+        band_mode = self.analysis_band_mode_combo.currentData()
+        render_active = self._render_supervisor is not None and not self._last_terminal_snapshot
+        self.analysis_roi_button.setEnabled(
+            analysis_enabled and self._source_probe_info is not None and not render_active
+        )
+        self.analysis_advanced_button.setEnabled(not render_active)
+        self.analysis_roi_label.setText(self._analysis_roi_summary())
+        self.analysis_band_summary_label.setText(self._analysis_band_summary())
+        self.analysis_advanced_summary_label.setText(self._analysis_advanced_summary())
+        for index, (enabled_check, low_spin, high_spin) in enumerate(self._manual_band_controls):
+            band_enabled = analysis_enabled and (
+                band_mode is AnalysisBandMode.MANUAL_MULTI
+                or (
+                    band_mode is AnalysisBandMode.MANUAL_SINGLE
+                    and index == 0
+                )
+            )
+            enabled_check.setEnabled(band_enabled)
+            low_spin.setEnabled(band_enabled and enabled_check.isChecked())
+            high_spin.setEnabled(band_enabled and enabled_check.isChecked())
+
+    def _analysis_band_summary(self) -> str:
+        band_mode = self.analysis_band_mode_combo.currentData()
+        manual_bands = self._build_manual_analysis_bands()
+        if band_mode is AnalysisBandMode.AUTO:
+            return (
+                f"Auto-bands will use the ROI spectrum and generate up to "
+                f"{self.analysis_auto_band_count_spin.value()} bands."
+            )
+        if not manual_bands:
+            return "Manual mode requires at least one band inside the selected render range."
+        return "Manual bands: " + ", ".join(
+            f"{band.low_hz:.2f}-{band.high_hz:.2f} Hz" for band in manual_bands
+        )
+
+    def _analysis_advanced_summary(self) -> str:
+        band_mode = self.analysis_band_mode_combo.currentData()
+        if band_mode is AnalysisBandMode.AUTO:
+            band_text = f"Auto-bands up to {self.analysis_auto_band_count_spin.value()}"
+        else:
+            manual_bands = self._build_manual_analysis_bands()
+            band_text = (
+                f"{len(manual_bands)} manual band"
+                f"{'' if len(manual_bands) == 1 else 's'}"
+            )
+        export_text = (
+            "advanced export on"
+            if self.analysis_export_advanced_checkbox.isChecked()
+            else "advanced export off"
+        )
+        return (
+            f"{band_text}, support {self.analysis_support_spin.value():.2f}, "
+            f"ROI quality {self.analysis_quality_cutoff_spin.value():.2f}, "
+            f"low-confidence {self.analysis_low_confidence_spin.value():.2f}, "
+            f"{export_text}."
+        )
 
     def _update_settings_state(self) -> None:
         processing_resolution = self.processing_resolution_combo.currentData()
@@ -1064,10 +1514,12 @@ class MainWindow(QMainWindow):
             and drift_gate_satisfied
             and intent.mask_feather_px > 0
             and intent.phase.high_hz > intent.phase.low_hz
+            and self._analysis_settings_valid(intent)
             and intent.output_resolution.width <= intent.processing_resolution.width
             and intent.output_resolution.height <= intent.processing_resolution.height
         )
         self._controller.set_settings_complete(settings_complete)
+        self._update_analysis_controls()
         self._refresh_state()
 
     def _zones_valid_for_current_source(self) -> bool:
@@ -1093,6 +1545,12 @@ class MainWindow(QMainWindow):
         self.exclusion_editor_button.setEnabled(
             self._source_probe_info is not None and not render_active
         )
+        self.analysis_enabled_checkbox.setEnabled(not render_active)
+        self.analysis_band_mode_combo.setEnabled(not render_active)
+        self.analysis_advanced_button.setEnabled(not render_active)
+        self.diagnostic_level_combo.setEnabled(not render_active)
+        self.diagnostics_cap_mb_spin.setEnabled(not render_active)
+        self.retention_budget_gb_spin.setEnabled(not render_active)
         self.source_browse_button.setEnabled(not render_active)
         self.metadata_load_button.setEnabled(not render_active)
         self.dry_run_button.setEnabled(
@@ -1103,6 +1561,7 @@ class MainWindow(QMainWindow):
         self.exclusion_editor_button.setText(
             f"Drift Check / Mask Zones ({len(self._exclusion_zones)})"
         )
+        self._update_analysis_controls()
 
         if self._source_probe_info is None:
             self.drift_gate_label.setText("Waiting for fast probe metadata.")
@@ -1160,14 +1619,31 @@ class MainWindow(QMainWindow):
         current_snapshot = self._current_snapshot()
         if current_snapshot is None:
             return
-        previous_state = self._controller.state
-        self._controller.mark_source_changed(current_snapshot)
-        if previous_state is UiState.READY and self._controller.state is UiState.LOADED:
-            self.fingerprint_label.setText("Source changed after fingerprint")
+        if detect_stale_source(self._last_known_snapshot, current_snapshot):
+            self._last_known_snapshot = current_snapshot
+            self._current_fingerprint = None
+            self._source_probe_info = None
+            self._first_frame_image = None
+            self._last_frame_image = None
+            self._suggested_frequency_band = None
+            self._band_user_edited = False
             self._drift_assessment = DriftAssessment()
+            self.source_metadata_label.setText("Probe pending...")
+            self.suggested_band_label.setText("Suggested band: analyzing source motion...")
+            self.apply_suggested_band_button.setEnabled(False)
+            self._set_first_frame_preview(None, "First frame preview pending...")
+            self.preflight_report_view.setPlainText("")
+            self._controller.load_source(current_snapshot)
             self._append_log(
-                "Source file size or modified time changed. Ready state was invalidated and drift attestation was cleared."
+                "Source file size or modified time changed. Probe, fingerprint, and drift review were restarted for the updated source."
             )
+            self._start_source_probe()
+            self._start_fingerprint()
+            self._start_frame_extraction()
+            self._update_settings_state()
+            return
+
+        self._controller.mark_source_changed(current_snapshot)
         self._refresh_state()
 
     def _load_from_sidecar(self) -> None:
@@ -1215,7 +1691,29 @@ class MainWindow(QMainWindow):
             self.output_resolution_combo.setCurrentIndex(output_index)
         self._exclusion_zones = intent.exclusion_zones
         self._mask_feather_px = intent.mask_feather_px
+        self._analysis_roi = intent.analysis.roi
+        self.analysis_enabled_checkbox.setChecked(intent.analysis.enabled)
+        self.analysis_band_mode_combo.setCurrentIndex(
+            self.analysis_band_mode_combo.findData(intent.analysis.band_mode)
+        )
+        self.analysis_support_spin.setValue(intent.analysis.minimum_cell_support_fraction)
+        self.analysis_quality_cutoff_spin.setValue(intent.analysis.roi_quality_cutoff)
+        self.analysis_low_confidence_spin.setValue(intent.analysis.low_confidence_threshold)
+        self.analysis_auto_band_count_spin.setValue(intent.analysis.auto_band_count)
+        self.analysis_export_advanced_checkbox.setChecked(intent.analysis.export_advanced_files)
+        manual_band_map = {band.band_id: band for band in intent.analysis.manual_bands}
+        for band_index, (enabled_check, low_spin, high_spin) in enumerate(
+            self._manual_band_controls,
+            start=1,
+        ):
+            band_id = f"band{band_index:02d}"
+            band = manual_band_map.get(band_id)
+            enabled_check.setChecked(band is not None)
+            if band is not None:
+                low_spin.setValue(band.low_hz)
+                high_spin.setValue(band.high_hz)
         self._drift_assessment = DriftAssessment()
+        self._update_analysis_controls()
 
     def _open_drift_editor(self) -> None:
         source_resolution = self._current_source_resolution()
@@ -1249,6 +1747,62 @@ class MainWindow(QMainWindow):
                 and not result.drift_assessment.acknowledged
             ):
                 self._append_log("Drift warning remains active without acknowledgement.")
+            self._update_settings_state()
+
+    def _open_analysis_roi_editor(self) -> None:
+        source_resolution = self._current_source_resolution()
+        if source_resolution is None:
+            QMessageBox.information(
+                self,
+                "Analysis ROI",
+                "Fast probe metadata is still required before the ROI editor can map geometry into source-frame coordinates.",
+            )
+            return
+
+        dialog = AnalysisRoiEditorDialog(
+            source_resolution=source_resolution,
+            roi=self._analysis_roi,
+            processing_zones=self._exclusion_zones,
+            first_frame=self._first_frame_image,
+            last_frame=self._last_frame_image,
+            parent=self,
+        )
+        if dialog.exec():
+            self._analysis_roi = dialog.result_data().roi
+            self._append_log(f"Updated analysis ROI: {self._analysis_roi_summary()}.")
+            self._update_settings_state()
+
+    def _open_analysis_advanced_dialog(self) -> None:
+        dialog = AnalysisAdvancedDialog(
+            band_mode=self.analysis_band_mode_combo.currentData(),
+            minimum_cell_support_fraction=float(self.analysis_support_spin.value()),
+            roi_quality_cutoff=float(self.analysis_quality_cutoff_spin.value()),
+            low_confidence_threshold=float(self.analysis_low_confidence_spin.value()),
+            auto_band_count=int(self.analysis_auto_band_count_spin.value()),
+            export_advanced_files=self.analysis_export_advanced_checkbox.isChecked(),
+            manual_band_values=self._current_manual_band_values(),
+            parent=self,
+        )
+        if dialog.exec():
+            result = dialog.result_data()
+            self.analysis_support_spin.setValue(result.minimum_cell_support_fraction)
+            self.analysis_quality_cutoff_spin.setValue(result.roi_quality_cutoff)
+            self.analysis_low_confidence_spin.setValue(result.low_confidence_threshold)
+            self.analysis_auto_band_count_spin.setValue(result.auto_band_count)
+            self.analysis_export_advanced_checkbox.setChecked(result.export_advanced_files)
+            for (enabled_check, low_spin, high_spin), (
+                enabled,
+                low_hz,
+                high_hz,
+            ) in zip(
+                self._manual_band_controls,
+                result.manual_band_values,
+                strict=True,
+            ):
+                enabled_check.setChecked(enabled)
+                low_spin.setValue(low_hz)
+                high_spin.setValue(high_hz)
+            self._append_log("Updated advanced analysis settings.")
             self._update_settings_state()
 
     def _run_dry_run_validation(self) -> None:
@@ -1503,6 +2057,15 @@ class MainWindow(QMainWindow):
             self._last_progress_frame_count = snapshot.frames_completed
             self._last_progress_at = now
             return
+        if snapshot.frames_completed < self._last_progress_frame_count:
+            # Stage-local frame counters can reset when decode hands off to
+            # phase processing or later stages. Treat that as a fresh baseline
+            # instead of pinning the UI to the previous stage's terminal count.
+            self._last_progress_frame_count = snapshot.frames_completed
+            self._last_progress_at = now
+            self._mean_seconds_per_frame = None
+            self.mean_frame_label.setText("-")
+            return
         if (
             snapshot.frames_completed <= self._last_progress_frame_count
             or self._last_progress_at is None
@@ -1575,9 +2138,7 @@ class MainWindow(QMainWindow):
         elif snapshot.phase == "complete":
             self.terminal_status_label.setText("Render Complete")
         elif snapshot.phase == "failed":
-            self.terminal_status_label.setText(
-                f"Render failed: {snapshot.failure_classification or snapshot.watchdog_classification or 'unknown_failure'}."
-            )
+            self.terminal_status_label.setText(self._format_terminal_summary(snapshot))
         elif snapshot.phase == "cancelled":
             self.terminal_status_label.setText("Render cancelled.")
         else:
@@ -1697,10 +2258,14 @@ class MainWindow(QMainWindow):
         if event.message_type == "artifact_paths":
             return "Final artifact paths reported by the worker."
         if event.message_type == "failure":
-            return (
+            detail = payload.get("detail")
+            message = (
                 f"Worker reported failure '{payload.get('classification', 'unknown_failure')}' "
                 f"at stage '{payload.get('stage', 'unknown')}'."
             )
+            if detail:
+                return f"{message} Detail: {detail}"
+            return message
         if event.message_type == "job_completed":
             return "Worker reported completed output pair."
         if event.message_type == "job_cancelled":
@@ -1712,10 +2277,13 @@ class MainWindow(QMainWindow):
             return "Render completed successfully."
         if snapshot.phase == "cancelled":
             return "Render cancelled before completion."
-        return (
+        summary = (
             "Render failed with "
             f"{snapshot.failure_classification or snapshot.watchdog_classification or 'unknown_failure'}."
         )
+        if snapshot.failure_detail:
+            return f"{summary} {snapshot.failure_detail}"
+        return summary
 
     def _build_render_request(self) -> RenderRequest:
         if self._current_source_path is None or not self._current_source_path.exists():

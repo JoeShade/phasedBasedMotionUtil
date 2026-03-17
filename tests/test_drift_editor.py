@@ -10,7 +10,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtWidgets import QApplication, QWidget
 
-from phase_motion_app.app.drift_editor import CanvasTool, DriftCanvas, DriftEditorDialog
+from phase_motion_app.app.drift_editor import (
+    AnalysisRoiEditorDialog,
+    CanvasTool,
+    DriftCanvas,
+    DriftEditorDialog,
+)
 from phase_motion_app.core.drift import DriftAssessment
 from phase_motion_app.core.models import ExclusionZone, Resolution, ZoneMode, ZoneShape
 
@@ -209,3 +214,62 @@ def test_drift_canvas_uses_crosshair_cursor_over_image_when_add_rectangle_active
 
     assert active_shape is Qt.CursorShape.CrossCursor
     assert inactive_shape is not Qt.CursorShape.CrossCursor
+
+
+def test_analysis_roi_editor_defaults_to_whole_frame_fallback() -> None:
+    app = _app()
+    dialog = AnalysisRoiEditorDialog(
+        source_resolution=Resolution(100, 50),
+        roi=None,
+    )
+
+    try:
+        summary_text = dialog.summary_label.text()
+        result = dialog.result_data()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert "Whole-frame" in summary_text
+    assert result.roi is None
+
+
+def test_analysis_roi_editor_explains_processing_mask_fallback() -> None:
+    app = _app()
+    dialog = AnalysisRoiEditorDialog(
+        source_resolution=Resolution(100, 50),
+        roi=None,
+        processing_zones=(
+            ExclusionZone(
+                zone_id="include-main",
+                shape=ZoneShape.RECTANGLE,
+                mode=ZoneMode.INCLUDE,
+                x=10.0,
+                y=5.0,
+                width=50.0,
+                height=30.0,
+            ),
+            ExclusionZone(
+                zone_id="exclude-background",
+                shape=ZoneShape.RECTANGLE,
+                mode=ZoneMode.EXCLUDE,
+                x=15.0,
+                y=10.0,
+                width=10.0,
+                height=10.0,
+            ),
+        ),
+    )
+
+    try:
+        summary_text = dialog.summary_label.text()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert "processing inclusion zones" in summary_text
+    assert "reduced by exclusion zones" in summary_text

@@ -263,6 +263,17 @@ class _FakePipe:
         self._events.append(f"{self._name}_close")
 
 
+class _FakeLinePipe(_FakePipe):
+    def __init__(self, events: list[str], name: str, lines: list[bytes]) -> None:
+        super().__init__(events, name)
+        self._lines = list(lines)
+
+    def readline(self) -> bytes:
+        if self._lines:
+            return self._lines.pop(0)
+        return b""
+
+
 class _FakeProcess:
     def __init__(self, events: list[str], wait_outcomes: list[object]) -> None:
         self.stdin = _FakePipe(events, "stdin")
@@ -283,6 +294,9 @@ class _FakeProcess:
 
     def kill(self) -> None:
         self._events.append("kill")
+
+    def poll(self) -> int | None:
+        return None
 
 
 def _patch_fake_popen(monkeypatch, fake_process: _FakeProcess) -> None:
@@ -422,3 +436,40 @@ def test_encode_cancel_closes_stdin_before_terminate_and_kill(monkeypatch) -> No
     assert exit_code == 9
     assert events.index("stdin_close") < events.index("terminate")
     assert events.index("terminate") < events.index("kill")
+
+
+def test_rawvideo_encode_process_retains_recent_non_progress_stderr(monkeypatch) -> None:
+    events: list[str] = []
+    fake_process = _FakeProcess(events, [0])
+    fake_process.stderr = _FakeLinePipe(
+        events,
+        "stderr",
+        [
+            b"frame=1\n",
+            b"[libx264 @ 000001] width not divisible by 2 (853x480)\n",
+            b"Error initializing output stream 0:0 -- Error while opening encoder\n",
+            b"",
+        ],
+    )
+    _patch_fake_popen(monkeypatch, fake_process)
+
+    encoder = RawvideoEncodeProcess(
+        staged_output_path="output.mp4",
+        resolution=Resolution(853, 480),
+        fps=2.0,
+        codec="libx264",
+        pixel_format="yuv420p",
+        color_tags={
+            "color_primaries": "bt709",
+            "color_transfer": "bt709",
+            "color_space": "bt709",
+            "color_range": "tv",
+        },
+    )
+    encoder._stderr_thread.join(timeout=1.0)
+    summary = encoder.latest_stderr_summary()
+    encoder.cancel()
+
+    assert summary is not None
+    assert "width not divisible by 2" in summary
+    assert "Error initializing output stream" in summary

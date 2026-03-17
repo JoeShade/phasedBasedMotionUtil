@@ -25,7 +25,10 @@ from PyQt6.QtWidgets import (
 )
 
 from phase_motion_app.core.drift import DriftAssessment
-from phase_motion_app.core.masking import validate_exclusion_zones
+from phase_motion_app.core.masking import (
+    explain_automatic_analysis_roi,
+    validate_exclusion_zones,
+)
 from phase_motion_app.core.models import ExclusionZone, Resolution, ZoneMode, ZoneShape
 
 
@@ -54,6 +57,13 @@ class DriftEditorResult:
     drift_assessment: DriftAssessment
 
 
+@dataclass(frozen=True)
+class AnalysisRoiEditorResult:
+    """This result object returns the single analysis ROI back to the main shell while preserving the whole-frame fallback when no ROI is drawn."""
+
+    roi: ExclusionZone | None
+
+
 class DriftCanvas(QWidget):
     """This widget shows inspection imagery and lets the operator edit static mask zones in source-frame coordinates."""
 
@@ -65,6 +75,7 @@ class DriftCanvas(QWidget):
         *,
         source_resolution: Resolution,
         zones: tuple[ExclusionZone, ...],
+        max_zones: int | None = None,
         first_frame: QImage | None = None,
         last_frame: QImage | None = None,
         parent: QWidget | None = None,
@@ -88,6 +99,7 @@ class DriftCanvas(QWidget):
         self._drag_origin_zone: ExclusionZone | None = None
         self._draft_zone: ExclusionZone | None = None
         self._next_zone_index = len(zones) + 1
+        self._max_zones = max_zones
         self.setMinimumSize(640, 420)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -310,7 +322,10 @@ class DriftCanvas(QWidget):
         if self._drag_mode in {"create_rectangle", "create_circle"} and self._draft_zone is not None:
             issues = validate_exclusion_zones((self._draft_zone,), self.source_resolution)
             if not issues:
-                self._zones.append(self._draft_zone)
+                if self._max_zones == 1:
+                    self._zones = [self._draft_zone]
+                else:
+                    self._zones.append(self._draft_zone)
                 self._selected_zone_id = self._draft_zone.zone_id
                 self._next_zone_index += 1
                 self.zones_changed.emit(self.zones)
@@ -830,4 +845,154 @@ class DriftEditorDialog(QDialog):
         return (
             f"{assessment.estimated_global_drift_px:.2f} px "
             f"(threshold {assessment.advisory_threshold_px:.2f} px)"
+        )
+
+
+class AnalysisRoiEditorDialog(QDialog):
+    """This dialog reuses the same rectangle and circle authoring tools as the mask editor but constrains them to one analysis ROI."""
+
+    def __init__(
+        self,
+        *,
+        source_resolution: Resolution,
+        roi: ExclusionZone | None,
+        processing_zones: tuple[ExclusionZone, ...] = (),
+        first_frame: QImage | None = None,
+        last_frame: QImage | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Analysis ROI")
+        self.resize(980, 720)
+        self.canvas = DriftCanvas(
+            source_resolution=source_resolution,
+            zones=() if roi is None else (self._normalize_roi(roi),),
+            max_zones=1,
+            first_frame=first_frame,
+            last_frame=last_frame,
+        )
+        self.canvas.set_creation_mode(ZoneMode.INCLUDE)
+        self._processing_zones = processing_zones
+
+        self._blink_timer = QTimer(self)
+        self._blink_timer.setInterval(500)
+        self._blink_timer.timeout.connect(self._toggle_blink_phase)
+
+        layout = QVBoxLayout(self)
+        controls = QWidget()
+        controls_layout = QGridLayout(controls)
+
+        self.view_mode_combo = QComboBox()
+        self.view_mode_combo.addItem("First frame", FrameInspectionMode.FIRST)
+        self.view_mode_combo.addItem("Last frame", FrameInspectionMode.LAST)
+        self.view_mode_combo.addItem("First vs Last overlay", FrameInspectionMode.OVERLAY)
+        self.overlay_slider = QSlider(Qt.Orientation.Horizontal)
+        self.overlay_slider.setRange(0, 100)
+        self.overlay_slider.setValue(50)
+        self.blink_checkbox = QCheckBox("Blink")
+        self.select_button = QPushButton("Select / Move")
+        self.add_rectangle_button = QPushButton("Add Rectangle")
+        self.add_circle_button = QPushButton("Add Circle")
+        for button in (self.add_rectangle_button, self.add_circle_button):
+            button.setCheckable(True)
+        self.clear_button = QPushButton("Clear ROI")
+        self.fit_button = QPushButton("Fit")
+        self.one_to_one_button = QPushButton("1:1")
+        self.summary_label = QLabel(self._summary_text())
+        self.summary_label.setWordWrap(True)
+
+        controls_layout.addWidget(QLabel("View"), 0, 0)
+        controls_layout.addWidget(self.view_mode_combo, 0, 1)
+        controls_layout.addWidget(QLabel("Overlay opacity"), 0, 2)
+        controls_layout.addWidget(self.overlay_slider, 0, 3)
+        controls_layout.addWidget(self.blink_checkbox, 0, 4)
+        controls_layout.addWidget(self.select_button, 1, 0)
+        controls_layout.addWidget(self.add_rectangle_button, 1, 1)
+        controls_layout.addWidget(self.add_circle_button, 1, 2)
+        controls_layout.addWidget(self.clear_button, 1, 3)
+        controls_layout.addWidget(self.fit_button, 2, 0)
+        controls_layout.addWidget(self.one_to_one_button, 2, 1)
+        controls_layout.addWidget(self.summary_label, 2, 2, 1, 3)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(controls)
+        layout.addWidget(self.canvas, stretch=1)
+        layout.addWidget(buttons)
+
+        self.view_mode_combo.currentIndexChanged.connect(self._update_view_mode)
+        self.overlay_slider.valueChanged.connect(
+            lambda value: self.canvas.set_overlay_opacity(value / 100.0)
+        )
+        self.blink_checkbox.toggled.connect(self._set_blink_enabled)
+        self.select_button.clicked.connect(lambda: self._set_canvas_tool(CanvasTool.SELECT))
+        self.add_rectangle_button.clicked.connect(
+            lambda: self._set_canvas_tool(CanvasTool.ADD_RECTANGLE)
+        )
+        self.add_circle_button.clicked.connect(
+            lambda: self._set_canvas_tool(CanvasTool.ADD_CIRCLE)
+        )
+        self.clear_button.clicked.connect(self.canvas.clear_zones)
+        self.fit_button.clicked.connect(self.canvas.set_fit_view)
+        self.one_to_one_button.clicked.connect(self.canvas.set_one_to_one_view)
+        self.canvas.zones_changed.connect(lambda _zones: self.summary_label.setText(self._summary_text()))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        self._set_canvas_tool(CanvasTool.SELECT)
+        self._update_view_mode()
+
+    def result_data(self) -> AnalysisRoiEditorResult:
+        roi = self.canvas.zones[0] if self.canvas.zones else None
+        return AnalysisRoiEditorResult(roi=None if roi is None else self._normalize_roi(roi))
+
+    def _update_view_mode(self) -> None:
+        self.canvas.set_mode(self.view_mode_combo.currentData())
+
+    def _set_canvas_tool(self, tool: CanvasTool) -> None:
+        self.canvas.set_tool(tool)
+        self.add_rectangle_button.setChecked(tool is CanvasTool.ADD_RECTANGLE)
+        self.add_circle_button.setChecked(tool is CanvasTool.ADD_CIRCLE)
+
+    def _set_blink_enabled(self, enabled: bool) -> None:
+        self.canvas.set_blink_enabled(enabled)
+        if enabled:
+            self._blink_timer.start()
+        else:
+            self._blink_timer.stop()
+            self.canvas.set_blink_phase(False)
+
+    def _toggle_blink_phase(self) -> None:
+        self.canvas.set_blink_phase(not self.canvas._blink_phase)
+
+    def _summary_text(self) -> str:
+        roi = self.canvas.zones[0] if self.canvas.zones else None
+        if roi is None:
+            return (
+                "Whole-frame ROI (automatic). "
+                f"{explain_automatic_analysis_roi(self._processing_zones)}"
+            )
+        if roi.shape is ZoneShape.RECTANGLE:
+            return (
+                f"Rectangle ROI at ({roi.x:.1f}, {roi.y:.1f}) with "
+                f"{(roi.width or 0.0):.1f} x {(roi.height or 0.0):.1f} px."
+            )
+        return (
+            f"Circle ROI centered at ({roi.x:.1f}, {roi.y:.1f}) with "
+            f"radius {(roi.radius or 0.0):.1f} px."
+        )
+
+    @staticmethod
+    def _normalize_roi(roi: ExclusionZone) -> ExclusionZone:
+        return ExclusionZone(
+            zone_id="analysis-roi",
+            shape=roi.shape,
+            x=roi.x,
+            y=roi.y,
+            mode=ZoneMode.INCLUDE,
+            width=roi.width,
+            height=roi.height,
+            radius=roi.radius,
+            label=roi.label or "Analysis ROI",
         )

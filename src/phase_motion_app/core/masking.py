@@ -99,6 +99,40 @@ def validate_exclusion_zones(
     return tuple(issues)
 
 
+def summarize_automatic_analysis_roi(zones: tuple[ExclusionZone, ...]) -> str:
+    """Describe the no-manual-ROI fallback so the shell can explain that analysis follows the same processing mask as render output."""
+
+    has_include = any(zone.mode is ZoneMode.INCLUDE for zone in zones)
+    has_exclude = any(zone.mode is ZoneMode.EXCLUDE for zone in zones)
+    if has_include and has_exclude:
+        return (
+            "Whole-frame ROI (automatic; constrained by processing inclusion zones "
+            "and reduced by exclusion zones)"
+        )
+    if has_include:
+        return "Whole-frame ROI (automatic; limited to processing inclusion zones)"
+    if has_exclude:
+        return "Whole-frame ROI (automatic; excludes processing mask zones)"
+    return "Whole-frame ROI (automatic)"
+
+
+def explain_automatic_analysis_roi(zones: tuple[ExclusionZone, ...]) -> str:
+    """Return one plain-language sentence for dialogs that need to explain the automatic ROI scope."""
+
+    has_include = any(zone.mode is ZoneMode.INCLUDE for zone in zones)
+    has_exclude = any(zone.mode is ZoneMode.EXCLUDE for zone in zones)
+    if has_include and has_exclude:
+        return (
+            "The analysis will use the full frame, constrained by processing inclusion "
+            "zones and then reduced by exclusion zones."
+        )
+    if has_include:
+        return "The analysis will use the full frame, limited to processing inclusion zones."
+    if has_exclude:
+        return "The analysis will use the full frame with processing exclusion zones removed."
+    return "The analysis will use the full frame."
+
+
 def scale_zone_to_domain(
     zone: ExclusionZone, source_resolution: Resolution, target_resolution: Resolution
 ) -> ExclusionZone:

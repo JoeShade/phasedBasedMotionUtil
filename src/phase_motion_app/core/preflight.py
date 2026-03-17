@@ -112,6 +112,17 @@ class PreflightReport:
         return not self.blockers
 
 
+def _estimate_diagnostics_bytes(diagnostic_level: DiagnosticLevel) -> int:
+    """Keep diagnostics-size assumptions in one place so scratch and retention logic use the same bucket definition."""
+
+    return {
+        DiagnosticLevel.OFF: 0,
+        DiagnosticLevel.BASIC: 32 * 1024 * 1024,
+        DiagnosticLevel.DETAILED: 128 * 1024 * 1024,
+        DiagnosticLevel.TRACE: 256 * 1024 * 1024,
+    }[diagnostic_level]
+
+
 def choose_scheduler_inputs(
     *,
     intent: JobIntent,
@@ -187,12 +198,7 @@ def estimate_active_scratch_bytes(inputs: PreflightInputs) -> int:
     )
     per_frame_rgb_bytes = proc_pixels * 3 * inputs.scheduler.precision_bytes
     chunk_bytes = per_frame_rgb_bytes * inputs.scheduler.chunk_frames
-    diagnostics_bytes = {
-        DiagnosticLevel.OFF: 0,
-        DiagnosticLevel.BASIC: 32 * 1024 * 1024,
-        DiagnosticLevel.DETAILED: 128 * 1024 * 1024,
-        DiagnosticLevel.TRACE: 256 * 1024 * 1024,
-    }[inputs.diagnostic_level]
+    diagnostics_bytes = _estimate_diagnostics_bytes(inputs.diagnostic_level)
     mask_bytes = proc_pixels
     output_staging = estimate_output_staging_bytes(inputs.intent, inputs.source)
     normalized_source_bytes = 0
@@ -259,12 +265,7 @@ def estimate_streaming_fixed_ram_bytes(inputs: PreflightInputs) -> int:
         inputs.intent.output_resolution.width * inputs.intent.output_resolution.height,
         1,
     )
-    diagnostics_bytes = {
-        DiagnosticLevel.OFF: 0,
-        DiagnosticLevel.BASIC: 32 * 1024 * 1024,
-        DiagnosticLevel.DETAILED: 128 * 1024 * 1024,
-        DiagnosticLevel.TRACE: 256 * 1024 * 1024,
-    }[inputs.diagnostic_level]
+    diagnostics_bytes = _estimate_diagnostics_bytes(inputs.diagnostic_level)
     reference_bytes = proc_pixels * inputs.scheduler.precision_bytes
     mask_bytes = output_pixels * 4
     filter_state_bytes = max(proc_pixels // 4, 1) * inputs.scheduler.precision_bytes
@@ -323,6 +324,18 @@ def run_preflight(inputs: PreflightInputs) -> PreflightReport:
                 PreflightSeverity.BLOCKER,
                 "output_upscale_blocked",
                 "Output resolution must be equal to or smaller than processing resolution.",
+            )
+        )
+
+    if (
+        inputs.intent.output_resolution.width % 2 != 0
+        or inputs.intent.output_resolution.height % 2 != 0
+    ):
+        issues.append(
+            _issue(
+                PreflightSeverity.BLOCKER,
+                "output_resolution_even_required",
+                "The current MP4 encoder path requires even output width and height.",
             )
         )
 
@@ -491,8 +504,9 @@ def run_preflight(inputs: PreflightInputs) -> PreflightReport:
             )
         )
 
+    retained_run_allowance = _estimate_diagnostics_bytes(inputs.diagnostic_level)
     if (
-        inputs.budgets.retained_evidence_bytes + output_staging_required
+        inputs.budgets.retained_evidence_bytes + retained_run_allowance
         > inputs.budgets.retention_budget_bytes
     ):
         issues.append(

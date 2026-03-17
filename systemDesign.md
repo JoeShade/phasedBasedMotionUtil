@@ -32,6 +32,7 @@ The design incorporates the following key directions:
 - Provide a stable desktop workflow for running phase-based motion amplification on recorded videos.
 - Allow engineers to adjust the key signal-processing and export parameters through a GUI.
 - Support fixed-camera workflows with static mask zones so operators can either protect irrelevant regions or deliberately constrain amplification to an inclusion area.
+- Export quantitative NVH-style analysis artifacts during render so later engineering review can compare ROI spectra, heatmaps, and run metadata outside the app.
 - Preserve engineering integrity by preventing misleading output choices, especially upscaling and invalid temporal frequency selections.
 - Provide useful operational visibility through progress, stage reporting, diagnostics, and reproducibility metadata.
 - Fail safely and transparently under adverse conditions such as insufficient RAM, invalid frequency settings, corrupted sidecars, or worker-process failure.
@@ -141,6 +142,7 @@ The worker process is responsible for:
 - Deterministic source normalization when cadence or pixel geometry must be regularized before processing
 - Video decode
 - Phase-based processing
+- Quantitative analysis accumulation and artifact export
 - Exclusion-zone compositing
 - Video encode
 - Diagnostics output
@@ -336,6 +338,7 @@ The main setup screen should contain:
 - Processing resolution selector
 - Output resolution selector
 - Exclusion-zone editor launcher
+- Analysis section with ROI and band controls
 - Advanced settings drawer
 - Diagnostics drawer
 - Start Render action
@@ -354,6 +357,9 @@ These should be visible in the default view:
 - Processing resolution
 - Output resolution
 - Exclusion-zone editor button
+- Quantitative-analysis enable toggle
+- Quantitative-analysis ROI summary and editor button
+- Quantitative-analysis band mode selector
 - Load from Export Metadata button
 
 ### 9.2 Hidden Under Advanced
@@ -365,6 +371,7 @@ Advanced settings should include, as needed:
 - Dry-run validation trigger
 - Internal precision, if exposed at all
 - Optional feather width for exclusion-mask compositing
+- Quantitative-analysis thresholds, auto-band count, manual bands, and internal-export toggle
 
 ---
 
@@ -1429,6 +1436,110 @@ This section summarizes why the major architectural decisions were made. It is i
 - the MP4 alone is not enough to prove a trustworthy completed export
 - the matching sidecar carries provenance, pre-flight outcomes, output tags, and runtime facts needed for later review
 - treating the pair as authoritative is stricter, but it preserves reproducibility discipline
+
+---
+
+## 31. Quantitative Analysis Extension
+
+This section is normative for the NVH-oriented quantitative-analysis extension now implemented in the desktop application.
+
+### 31.1 Execution Boundary
+
+- Quantitative analysis runs only alongside the authoritative render path
+- The worker derives analysis traces from the internal motion-analysis backend, not from the encoded MP4
+- Analysis is enabled by default but may be disabled per run
+- Analysis uses the same configured render frequency range; there is no separate analysis-only band selection in v1
+
+### 31.2 ROI Model
+
+- Exactly one analysis ROI may be authored per run
+- The ROI uses the same rectangle and circle authoring tools as the drift / mask editor
+- If no manual ROI is drawn, the worker records and uses a visible **Whole-frame ROI**
+- Whole-frame ROI means the full frame, constrained by any inclusion zones and then reduced by exclusion zones
+- The ROI label written to exported artifacts is `Whole-frame ROI` for the fallback path
+
+### 31.3 Internal Analysis Hierarchy
+
+The implemented analysis hierarchy is:
+
+1. dense motion-grid traces over the processing-resolution working frames
+2. adaptive per-cell combination of X/Y/projected motion components
+3. ROI-cell traces and spectra from weighted groups of dense grid cells
+4. robust ROI spectrum from median aggregation of valid ROI-cell spectra
+5. supported-peak detection using valid-cell support fraction
+6. auto-band or manual-band resolution
+7. band-energy heatmaps on the dense analysis grid
+8. fixed-filename artifact export plus sidecar / diagnostics registration
+
+### 31.4 Quality and Reporting Rules
+
+- ROI-cell hard failures include masked-out cells, texture-poor cells, and cells with no usable motion signal
+- Rejected cells are excluded from ROI-spectrum aggregation but still penalize the overall ROI quality score
+- The exported ROI quality score records these sub-scores:
+  - texture adequacy
+  - valid-cell fraction
+  - inter-cell agreement
+  - peak consistency
+  - mask impact
+  - drift impact
+- Peak reporting is suppressed when overall ROI quality stays below the configured ROI quality cutoff
+- Heatmaps and traces still export when peak reporting is suppressed
+
+### 31.5 Band Selection
+
+- `Auto-bands` uses the aggregated ROI spectrum only
+- `Manual single band` uses one explicit low/high band
+- `Manual multiple bands` accepts up to five explicit low/high bands
+- Auto-band count is capped at five and is operator-configurable in Advanced settings
+- Nearby auto-bands are merged when they overlap or are insufficiently separated
+
+### 31.6 Heatmaps
+
+- Heatmaps use a denser grid than the ROI-cell grid
+- Each heatmap cell stores normalized band energy: band energy divided by total motion energy
+- Low-confidence cells remain visible in monochrome and are excluded from shared scale fitting
+- All heatmaps in one render share a robust percentile display scale
+
+### 31.7 Artifact Contract
+
+The worker writes these fixed filenames into the render output directory:
+
+- `roi_metrics.csv`
+- `roi_spectrum.json`
+- `roi_trace.csv`
+- `cell_traces.csv`
+- `cell_spectra.csv`
+- `analysis_metadata.json`
+- `heatmap_<band_id>.csv`
+- `heatmap_<band_id>.png`
+
+The sidecar `results.analysis` payload records:
+
+- analysis enablement and status
+- ROI mode, label, geometry, and quality score
+- reported peaks
+- generated heatmap bands
+- artifact paths
+- rejection statistics
+- auto-band merge steps
+- suppressed-peak reasons
+- shared heatmap-scale metadata
+
+### 31.8 Failure Boundary
+
+- If the MP4 render succeeds but quantitative-analysis export fails, the run still completes as a render success
+- The worker records the analysis issue as a warning, writes a minimal analysis metadata record when possible, and still finalizes the MP4 + sidecar pair
+- Diagnostics bundles include any analysis artifact paths that were successfully written
+
+## 32. Quantitative Analysis Implementation Notes
+
+The current implementation uses a dedicated dense motion-analysis grid inside the worker. That grid reuses the same local motion-estimation backend as the render engine, but it is kept separate from the amplification warp grid so the quantitative-analysis export contract can evolve without changing the encoded video path.
+
+UI contract:
+
+- A dedicated **Analysis** section exposes the enable toggle, ROI summary, ROI editor, and band mode selector
+- Advanced settings carry the curated analysis thresholds, auto-band count, manual bands, and the internal-export toggle
+- Completed-render UI remains export-oriented; quantitative outputs are written to artifacts rather than rendered inline in the completion screen
 
 ---
 

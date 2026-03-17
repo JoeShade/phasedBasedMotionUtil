@@ -1,198 +1,132 @@
 # Overview
 
-This review treated `systemDesign.md` as the architectural source of truth and audited the repository as an engineering tool rather than a demo application.
+This review treated `systemDesign.md` as the architectural source of truth and audited the repository as an offline engineering tool rather than a demo application.
 
-The codebase started with strong coverage around IPC, watchdog behavior, sidecar validation, and storage/finalization, but it had several material mismatches against the design contract. The most significant gap was memory handling: the worker still decoded and processed the full clip in memory even though the design required bounded chunk execution.
+The codebase already had strong coverage around IPC, terminal-outcome rules, staged MP4 validation, watchdog behavior, and most of the sidecar boundary. The main defects found in this pass were narrower but still important architecture issues:
 
-That gap is now closed. The render worker uses a bounded two-pass pipeline, shell and worker preflight both derive the same chunk plan from measured RAM, and long clips are now admitted when a safe batch plan exists. The full suite passes with `160` tests.
+- stale-source handling in the shell invalidated `Ready` but left stale probe/fingerprint context in place
+- the watchdog could wait forever if a worker acknowledged the session and then went silent before its first heartbeat
+- sidecar validation allowed normalized/VFR runs to omit required working-source metadata
+- pre-flight retention warnings still used output-staging bytes as if they were retention evidence
+
+All four defects were reproduced with new tests, fixed in small patches, and verified with the full suite.
 
 # Review Scope
 
-- Reviewed `systemDesign.md` first and used it as the primary architecture contract.
-- Audited the project layout under:
-  - `src/phase_motion_app/app`
-  - `src/phase_motion_app/core`
-  - `src/phase_motion_app/worker`
-  - `tests`
-- Focused extra attention on:
-  - shell vs worker separation
-  - spawn-only assumptions
-  - IPC protocol/session handling
-  - watchdog and terminal-state classification
-  - `Ready` vs `Fingerprint Pending`
-  - stale-source invalidation
-  - pre-flight admission checks
-  - sidecar schema and reload boundaries
-  - staged MP4 validation and paired-output finalization
-  - normalization of VFR and non-square-pixel inputs
-  - bounded-memory render execution
+- `systemDesign.md`
+- `src/phase_motion_app/app`
+- `src/phase_motion_app/core`
+- `src/phase_motion_app/worker`
+- `tests`
+
+Review emphasis:
+
+- shell vs worker separation
+- spawn-only assumptions
+- IPC handshake, session binding, and terminal-message rules
+- watchdog and silent-worker classification
+- `Ready` vs `Fingerprint Pending`
+- stale-source detection and recovery
+- sidecar schema, compatibility, and reload boundaries
+- pre-flight disk/RAM/retention separation
+- storage/finalization and lone-MP4 handling
+- CFR/VFR and normalized-working-source rules
+- diagnostics-cap behavior
 
 # Design Mismatches vs systemDesign.md
 
 ## Fixed in this review
 
-- The shell UI advanced from `Pre-flight Check` to `Rendering` too early.
-  - Worker-side `preflight` activity could move the shell into `Rendering` before the worker actually entered rendering.
+- `main_window.py` only downgraded the shell from `Ready` to `Loaded` when the source changed on disk. It did not restart the authoritative probe/fingerprint/drift-review flow, which left stale source metadata visible after readiness was invalidated.
+- `watchdog.py` only enforced heartbeat silence after at least one heartbeat had already arrived. A worker that completed the socket handshake and then hung could stay non-terminal indefinitely, which violated the watchdog policy in Sections 6 and 7.
+- `sidecar.py` validated the general schema shape but did not enforce normalization metadata when a derived working source was used. That violated Sections 22 and 23.
+- `preflight.py` used output-staging bytes when deciding whether to warn about the retention budget. That mixed the active-scratch bucket with the retention bucket in a way Section 12.2 / 25 explicitly forbids.
 
-- A failed worker bootstrap left the shell stuck in `Pre-flight Check`.
-  - Supervisor/start failures did not restore the UI to `Ready`.
+## Remaining partial mismatches
 
-- The shell imported the heavy worker implementation during GUI import.
-  - `app/main_window.py` imported `worker/render.py` directly, which leaked render-engine imports into the shell process.
-
-- The typed sidecar model dropped `results.output_details`.
-  - Schema validation allowed those fields, but the model layer discarded them.
-
-- Staged MP4 validation was stricter than the design contract.
-  - The implementation required both frame-count and duration evidence instead of accepting either valid CFR-consistency path.
-
-- Rotated-input ingest was not design-faithful.
-  - Probe geometry and raw decode geometry diverged when rotation metadata was present.
-
-- The worker still materialized the full decoded clip and large derived arrays in memory.
-  - This was the largest architecture mismatch against Sections 12.5, 16, 18, and 33.7.
-  - The worker now uses a bounded two-pass decode/process/encode pipeline instead of a full-clip in-memory path.
-
-- Shell-side and worker-side RAM admission math still modeled the old full-clip engine.
-  - Long clips could be rejected purely because of frame count even when a safe bounded chunk plan should have been allowed.
-  - Both paths now derive the same bounded scheduler plan from measured RAM and selected resource policy.
-
-## Still mismatched or only partially resolved
-
-- Probe-to-preflight enforcement is still incomplete for some source-format conditions.
-  - `SourceMetadata` supports rotation, display-transform, contradictory-color, and decode-format blockers.
-  - The current ffprobe-to-`SourceMetadata` path still hardcodes some of those values instead of deriving them all authoritatively.
-
-- The normalized-source path still stages a full derived working file when cadence or pixel geometry must be regularized.
-  - This is design-faithful, but it still shifts some large-input cost from RAM to scratch storage and I/O.
+- Retention-budget warning logic is now separated from output staging, but it is still a coarse estimate. It mainly predicts future diagnostics pressure, not every possible retained failed-run artifact shape.
+- The repository-level `docs/deviations.md` appears stale relative to the current worker implementation. The code now uses bounded sequential decode/process passes, so that document should be reconciled separately.
 
 # Bugs and Weaknesses Found
 
-- `MainWindow._apply_render_state()` promoted `PREFLIGHT_CHECK` to `RENDERING` on worker preflight snapshots.
-- `MainWindow._start_render()` could leave the controller in `PREFLIGHT_CHECK` after a bootstrap/start failure.
-- `JobResults.from_dict()` and `JobResults.to_dict()` did not preserve `results.output_details`.
-- `validate_staged_mp4()` rejected outputs when one valid CFR-consistency path was present but the other was missing.
-- `app/main_window.py` imported the heavy render worker module during GUI import instead of using a lightweight bootstrap layer.
-- Raw frame extraction and long-lived rawvideo decode let `ffmpeg` autorotate some inputs, which corrupted previews and would also destabilize render decode for rotated sources.
-- Probe metadata was not carrying rotation or sample-aspect-ratio facts into preflight classification.
-- The shell and worker both lacked a deterministic normalized-source path for VFR and non-square-pixel inputs.
-- The drift editor did not expose an explicit crosshair cursor when rectangle creation was active.
-- Last-frame shell preview extraction could fail on normalized VFR sources because the probe-side estimated frame count could land one frame past the actual `fps=` filter output boundary.
-- The worker decoded the full clip into RAM before phase processing and then allocated additional full-clip processing arrays.
-- Preflight RAM admission mirrored that full-clip assumption, so long clips were blocked even when bounded chunk execution was feasible.
+- Fixed: stale-source invalidation in the shell left stale probe/fingerprint context in memory and did not restart authoritative source checks.
+- Fixed: a post-handshake silent worker could evade both heartbeat timeout and stall classification forever.
+- Fixed: sidecars for normalized/VFR runs could be accepted without `working_fps`, `working_source_resolution`, or `normalization_steps`.
+- Fixed: retention warnings could fire purely because the output staging allowance was large, even when the retained-artifact budget itself was still acceptable.
+
+Additional review observations:
+
+- IPC/session binding, strict sequence handling, terminal success rules, cancellation handling, staged MP4 validation, lone-MP4 quarantine handling, diagnostics cap fallback order, and sidecar intent reload boundaries are already in good shape and are well covered by tests.
+- The shell/worker split and spawn-only worker startup are implemented in a design-faithful way.
 
 # Tests Run
 
-- Baseline before the deep review work: `pytest -q`
-  - Result: `127 passed`
-- Targeted regression passes during the review:
-  - `pytest -q tests/test_job_state.py tests/test_main_window.py tests/test_storage.py tests/test_sidecar.py tests/test_worker_bootstrap.py tests/test_render_worker.py`
-  - `pytest -q tests/test_ffprobe.py tests/test_media_tools.py tests/test_preflight.py tests/test_main_window.py`
-  - `pytest -q tests/test_phase_engine.py tests/test_preflight.py tests/test_render_worker.py`
-  - `pytest -q tests/test_main_window.py`
+- Baseline existing suite before changes: `pytest -q`
+  - Result: `165 passed`
+- Targeted regression pass after new tests and fixes: `pytest -q tests/test_preflight.py tests/test_sidecar.py tests/test_render_supervisor.py tests/test_main_window.py`
+  - Result: `74 passed`
 - Final full pass: `pytest -q`
-  - Result: `160 passed in 5.60s`
+  - Result: `169 passed in 7.30s`
 
 # Tests Added
 
-25 tests were added across the review.
+Four regression tests were added:
 
-- State-machine regressions for `Ready`, `Pre-flight Check`, and launch-failure recovery
-- Sidecar preservation/schema coverage for `output_details` and normalization metadata
-- Staged MP4 duration-only CFR validation coverage
-- Worker bootstrap boundary coverage
-- Rotation and sample-aspect-ratio probe coverage
-- Autorotation/preview decode regressions and normalized VFR last-frame extraction coverage
-- Normalization-plan and ffmpeg normalization-filter coverage
-- Crosshair cursor coverage for rectangle creation
-- Worker-side normalization metadata coverage
-- Streaming phase-engine coverage for chunked static and motion clips
-- Bounded scheduler coverage for long clips and tighter RAM budgets
-- Worker diagnostics coverage for the new two-pass bounded pipeline
+- `tests/test_preflight.py`
+  - `test_preflight_does_not_treat_output_staging_as_retention_evidence`
+- `tests/test_sidecar.py`
+  - `test_sidecar_schema_validation_rejects_missing_normalization_metadata`
+- `tests/test_render_supervisor.py`
+  - `test_render_supervisor_classifies_post_handshake_silence_as_unresponsive`
+- `tests/test_main_window.py`
+  - `test_main_window_restarts_probe_and_fingerprint_when_source_goes_stale`
 
 # Fixes Applied
 
-- Added `SingleJobController.abort_preflight()` in `src/phase_motion_app/core/job_state.py`.
-- Updated `src/phase_motion_app/app/main_window.py` to:
-  - keep the shell in `Pre-flight Check` until the worker actually reports rendering
-  - restore shell state if worker bootstrap/start fails
-  - launch through a lightweight bootstrap module instead of importing the heavy render module directly
-  - carry probe rotation/sample-aspect-ratio facts into shell-side source classification
-  - use normalized working source geometry for drift review, mask validation, pre-flight reporting, and resolution options
-  - derive shell-side chunk planning from the same bounded scheduler logic used by the worker
-- Added `src/phase_motion_app/worker/bootstrap.py` as the shell-safe spawn target and worker launch contract.
-- Updated `src/phase_motion_app/core/ffprobe.py` so probe results preserve rotation and sample-aspect-ratio metadata.
-- Added `src/phase_motion_app/core/source_normalization.py` so shell/media/worker all derive the same working cadence and square-pixel geometry.
-- Updated `src/phase_motion_app/core/media_tools.py` so raw frame extraction and rawvideo decode disable `ffmpeg` autorotation, apply deterministic working-source normalization, and can stage a normalized scratch source.
-- Updated `src/phase_motion_app/core/baseline_band.py` so baseline analysis uses the normalized working representation.
-- Updated `src/phase_motion_app/core/models.py` and `src/phase_motion_app/core/sidecar.py` so sidecars preserve `output_details` and normalization-aware preflight metadata.
-- Updated `src/phase_motion_app/core/preflight.py` to:
-  - admit VFR and non-square-pixel inputs through deterministic normalization warnings instead of hard rejection
-  - derive bounded scheduler inputs from measured RAM and resource policy
-  - estimate RAM against the bounded batch pipeline instead of full-clip reconstruction
-- Updated `src/phase_motion_app/core/storage.py` so staged MP4 CFR validation accepts either valid frame-count evidence or valid duration evidence.
-- Updated `src/phase_motion_app/core/phase_engine.py` to add a `StreamingPhaseAmplifier` that preserves a global reference frame and temporal filter state across bounded chunks.
-- Updated `src/phase_motion_app/worker/render.py` to:
-  - use the shared bounded scheduler plan
-  - run a bounded reference-scan decode pass
-  - re-decode in bounded batches for phase processing
-  - stream amplify/composite output directly into the encoder without holding the whole clip in RAM
-  - record two-pass bounded-pipeline decisions in diagnostics
-- Updated `systemDesign.md` to formalize the bounded-memory contract and allow sequential bounded decode passes when global reference statistics are required.
+- `src/phase_motion_app/app/main_window.py`
+  - stale-source polling now clears stale authoritative source state and restarts probe, fingerprint, and frame extraction for the updated file instead of leaving the shell on stale context
+- `src/phase_motion_app/core/watchdog.py`
+  - added shell-local telemetry anchoring so a connected worker that never reaches its first heartbeat still times out
+- `src/phase_motion_app/core/render_supervisor.py`
+  - the supervisor now records handshake receipt as watchdog telemetry, which closes the post-handshake silent-worker gap
+- `src/phase_motion_app/core/sidecar.py`
+  - added semantic validation requiring normalization metadata when a derived working source was used
+- `src/phase_motion_app/core/preflight.py`
+  - retention warnings now use a retention-domain diagnostics allowance instead of output-staging bytes
 
 # Files Changed
 
+Files changed in this review pass:
+
 - `codeReviewFindings.md`
-- `systemDesign.md`
 - `src/phase_motion_app/app/main_window.py`
-- `src/phase_motion_app/core/baseline_band.py`
-- `src/phase_motion_app/core/ffprobe.py`
-- `src/phase_motion_app/core/job_state.py`
-- `src/phase_motion_app/core/media_tools.py`
-- `src/phase_motion_app/core/models.py`
-- `src/phase_motion_app/core/phase_engine.py`
 - `src/phase_motion_app/core/preflight.py`
+- `src/phase_motion_app/core/render_supervisor.py`
 - `src/phase_motion_app/core/sidecar.py`
-- `src/phase_motion_app/core/source_normalization.py`
-- `src/phase_motion_app/core/storage.py`
-- `src/phase_motion_app/worker/bootstrap.py`
-- `src/phase_motion_app/worker/render.py`
-- `tests/test_ffprobe.py`
-- `tests/test_drift_editor.py`
-- `tests/test_job_state.py`
+- `src/phase_motion_app/core/watchdog.py`
 - `tests/test_main_window.py`
-- `tests/test_media_tools.py`
-- `tests/test_phase_engine.py`
 - `tests/test_preflight.py`
-- `tests/test_render_worker.py`
+- `tests/test_render_supervisor.py`
 - `tests/test_sidecar.py`
-- `tests/test_source_normalization.py`
-- `tests/test_storage.py`
-- `tests/test_worker_bootstrap.py`
+
+Note:
+
+- The worktree contained other pre-existing modified and untracked files before this pass. They were reviewed where relevant, but they were not altered by these fixes.
 
 # Remaining Risks
 
-- The bounded scheduler is still heuristic.
-  - It is materially better than the old full-clip admission model, but Python/NumPy memory behavior is still approximate rather than exact.
-
-- The new streaming phase path is operationally safer than the old full-clip path, but it is not numerically identical to the previous whole-signal FFT-style surrogate.
-  - That is an acceptable trade for bounded execution, but it remains an engineering tradeoff worth documenting.
-
-- Automatic normalization still depends on scratch/storage headroom.
-  - Large VFR or non-square-pixel sources may now pass RAM admission but still fail active-scratch admission if normalization staging cannot be reserved safely.
-
-- Probe-to-policy coverage is still incomplete for some source-format blockers.
-  - Display-transform, contradictory-color, and unsupported-decoder signals still need more authoritative probe integration.
+- Retention forecasting is still approximate. The current warning logic is now bucket-correct, but it does not attempt to predict every possible retained failed-run partial.
+- Some of the most important paths still rely more on unit/integration-style harnesses than on real-media end-to-end tests. That is acceptable for now, but the highest-risk operational paths remain the spawned worker plus real ffmpeg toolchain interactions.
+- `docs/deviations.md` is likely no longer accurate and could mislead future maintenance unless it is updated.
 
 # Open Issues
 
-- Extend authoritative source probing so pre-flight can enforce the remaining blocked-input rules rather than relying on hardcoded defaults.
-- Consider adding more integration tests around forced low-RAM scheduler choices in the spawned worker path, not just preflight math and diagnostics output.
-- Consider recording observed peak batch memory in diagnostics when a portable cross-platform method is available.
-- Consider tightening the streaming temporal filter characterization with more synthetic signal tests if output interpretability becomes a higher-stakes requirement.
+- Reconcile or replace `docs/deviations.md` so it matches the current implementation and does not contradict the actual worker pipeline.
+- Add more real-media integration coverage around normalized working-source renders and worker failure recovery if test assets/practical runtime allow it.
+- Consider a richer retention forecast model if operators rely heavily on retained failed-run evidence and large diagnostics bundles.
 
 # Final Assessment
 
-Implementation quality is solid and materially better aligned with the architecture than it was at the start of the review. The shell/worker boundary is cleaner, sidecar fidelity is better, normalization is deterministic, staged-output validation matches the contract, and the render path no longer assumes the whole clip fits in RAM.
+The repository is in generally solid shape and already aligned with most of `systemDesign.md` in the highest-risk areas. The shell/worker boundary, spawn-only process model, IPC contract, watchdog classifications, storage/finalization rules, and sidecar intent boundary are materially stronger than a typical desktop utility at this stage.
 
-The largest prior architecture risk was the full-clip in-memory worker. That is now replaced with a bounded two-pass pipeline and matching RAM admission logic, which is the most important improvement from this review. The main remaining risks are heuristic rather than structural: scheduler estimation accuracy, scratch-heavy normalization on some inputs, and incomplete probe-to-policy enforcement for a few source-format blockers.
+This review found four concrete defects that mattered to architectural correctness, and all four were fixed with direct regression coverage. After those fixes, the suite is green at `169 passed`, and the remaining concerns are mostly around documentation drift and additional end-to-end coverage rather than obvious logic or state-machine breaks.

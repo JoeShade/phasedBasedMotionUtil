@@ -26,6 +26,7 @@ class WorkerBehavior:
     progress_steps: int = 2
     exit_code: int = 0
     terminal_settle_seconds: float = 0.05
+    failure_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -168,7 +169,14 @@ def worker_process_main(config: WorkerLaunchConfig, cancel_event: EventType) -> 
                 seq=sequence.next(),
                 message_type="failure",
                 monotonic_time_ns=time.monotonic_ns(),
-                payload={"classification": "internal_processing_exception"},
+                payload={
+                    "classification": "internal_processing_exception",
+                    **(
+                        {}
+                        if config.behavior.failure_detail is None
+                        else {"detail": config.behavior.failure_detail}
+                    ),
+                },
             )
         )
         settle_and_exit(config.behavior.exit_code or 1)

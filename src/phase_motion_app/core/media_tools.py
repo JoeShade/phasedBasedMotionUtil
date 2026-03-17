@@ -305,6 +305,7 @@ class RawvideoEncodeProcess:
             stderr=subprocess.PIPE,
         )
         self._last_progress_counter: int | None = None
+        self._recent_stderr_lines: list[str] = []
         self._stderr_thread = threading.Thread(
             target=self._drain_progress_stream,
             name="ffmpeg-encode-progress",
@@ -323,15 +324,34 @@ class RawvideoEncodeProcess:
 
         return self._last_progress_counter
 
+    def latest_stderr_summary(self) -> str | None:
+        """Return the last few non-progress stderr lines so worker failures can surface ffmpeg's actual reason."""
+
+        if not self._recent_stderr_lines:
+            return None
+        return " | ".join(self._recent_stderr_lines)
+
     def _drain_progress_stream(self) -> None:
         assert self.process.stderr is not None
         while True:
             line = self.process.stderr.readline()
             if not line:
                 break
-            counter = _parse_progress_counter(line)
+            text = line.decode("utf-8", errors="ignore").strip()
+            if not text:
+                continue
+            counter = _parse_progress_counter_text(text)
             if counter is not None:
                 self._last_progress_counter = counter
+                continue
+            self._remember_stderr_line(text)
+
+    def _remember_stderr_line(self, text: str) -> None:
+        if self._recent_stderr_lines and self._recent_stderr_lines[-1] == text:
+            return
+        self._recent_stderr_lines.append(text)
+        if len(self._recent_stderr_lines) > 6:
+            self._recent_stderr_lines.pop(0)
 
     def finish(self) -> int:
         """Close encoder input and wait for the final exit code."""
@@ -491,6 +511,12 @@ def _parse_progress_counter(line: bytes) -> int | None:
     """Parse one ffmpeg progress line and ignore unrelated stderr text safely."""
 
     text = line.decode("utf-8", errors="ignore").strip()
+    return _parse_progress_counter_text(text)
+
+
+def _parse_progress_counter_text(text: str) -> int | None:
+    """Parse one decoded ffmpeg progress line and ignore unrelated stderr text safely."""
+
     if not text.startswith("frame="):
         return None
     _, value = text.split("=", 1)
