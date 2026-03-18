@@ -1,3 +1,5 @@
 # Current Deviations from `systemDesign.md`
 
-- The worker still reconstructs the full decoded clip in memory before phase processing instead of running a fully bounded chunk-to-numeric pipeline with reusable lossless chunk blocks. The decode subprocess itself is long-lived and bounded per read, but the later numeric path is still more memory-hungry than the final architecture target.
+No material code/design mismatches are intentionally tracked at this time.
+
+Use this file only for active temporary divergences that should be reconciled in code or in `systemDesign.md`. Remove resolved items instead of leaving historical review notes behind.

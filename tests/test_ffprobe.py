@@ -122,3 +122,74 @@ def test_parse_ffprobe_json_captures_rotation_and_sample_aspect_ratio() -> None:
 
     assert info.rotation_degrees == -90.0
     assert info.sample_aspect_ratio == pytest.approx(4.0 / 3.0)
+
+
+def test_parse_ffprobe_json_treats_malformed_rate_fields_as_non_cfr() -> None:
+    payload = {
+        "streams": [
+            {
+                "codec_type": "video",
+                "width": 640,
+                "height": 360,
+                "r_frame_rate": "N/A",
+                "avg_frame_rate": "not-a-rate",
+                "nb_frames": "0",
+                "duration": "1.5",
+                "codec_name": "h264",
+                "bits_per_raw_sample": "8",
+            }
+        ],
+        "format": {"duration": "1.5"},
+    }
+
+    info = parse_ffprobe_json(payload)
+
+    assert info.fps == 0.0
+    assert info.avg_fps == 0.0
+    assert info.is_cfr is False
+
+
+def test_parse_ffprobe_json_requires_a_video_stream() -> None:
+    with pytest.raises(ValueError, match="video stream"):
+        parse_ffprobe_json({"streams": [{"codec_type": "audio"}], "format": {}})
+
+# ######################################################################################################################
+#
+#
+#                                         AAAAAAAA
+#                                       AAAA    AAAAA              AAAAAAAA
+#                                     AAA          AAA           AAAA    AAA
+#                                     AA            AA          AAA       AAA
+#                                     AA            AAAAAAAAAA  AAA       AAAAAAAAAA
+#                                     AAA                  AAA  AAA               AA
+#                                      AAA                AAA    AAAAA            AA
+#                                       AAAAA            AAA        AAA           AA
+#                                          AAA          AAA                       AA
+#                                          AAA         AAA                        AA
+#                                          AA         AAA                         AA
+#                                          AA        AAA                          AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AA                   AAAAAAAAAAAAAA     AA
+#                                         AA  AAAAAAAAAAAAAAAAAAAAAAAA    AAAAAAA AA
+#                                        AAAAAAAAAAA                           AA AA
+#                                                                            AAA  AA
+#                                                                          AAAA   AA
+#                                                                       AAAA      AA
+#                                                                    AAAAA        AA
+#                                                                AAAAA            AA
+#                                                             AAAAA               AA
+#                                                         AAAAAA                  AA
+#                                                     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+#
+#
+# ######################################################################################################################
+#
+#                                                 Copyright (c) JoeShade
+#                               Licensed under the GNU Affero General Public License v3.0
+#
+# ######################################################################################################################
+#
+#                                         +44 (0) 7356 042702 | joe@jshade.co.uk
+#
+# ######################################################################################################################

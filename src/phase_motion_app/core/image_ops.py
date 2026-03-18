@@ -61,3 +61,44 @@ def resize_rgb_frames_bilinear(frames: np.ndarray, target: Resolution) -> np.nda
     cols1 = interp_y[:, :, x1, :]
     resized = cols0 * (1.0 - wx)[None, None, :, None] + cols1 * wx[None, None, :, None]
     return resized.astype(np.float32, copy=False)
+
+# ######################################################################################################################
+#
+#
+#                                         AAAAAAAA
+#                                       AAAA    AAAAA              AAAAAAAA
+#                                     AAA          AAA           AAAA    AAA
+#                                     AA            AA          AAA       AAA
+#                                     AA            AAAAAAAAAA  AAA       AAAAAAAAAA
+#                                     AAA                  AAA  AAA               AA
+#                                      AAA                AAA    AAAAA            AA
+#                                       AAAAA            AAA        AAA           AA
+#                                          AAA          AAA                       AA
+#                                          AAA         AAA                        AA
+#                                          AA         AAA                         AA
+#                                          AA        AAA                          AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AA                   AAAAAAAAAAAAAA     AA
+#                                         AA  AAAAAAAAAAAAAAAAAAAAAAAA    AAAAAAA AA
+#                                        AAAAAAAAAAA                           AA AA
+#                                                                            AAA  AA
+#                                                                          AAAA   AA
+#                                                                       AAAA      AA
+#                                                                    AAAAA        AA
+#                                                                AAAAA            AA
+#                                                             AAAAA               AA
+#                                                         AAAAAA                  AA
+#                                                     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+#
+#
+# ######################################################################################################################
+#
+#                                                 Copyright (c) JoeShade
+#                               Licensed under the GNU Affero General Public License v3.0
+#
+# ######################################################################################################################
+#
+#                                         +44 (0) 7356 042702 | joe@jshade.co.uk
+#
+# ######################################################################################################################

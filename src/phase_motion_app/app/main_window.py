@@ -995,6 +995,36 @@ class MainWindow(QMainWindow):
             modified_ns=stat.st_mtime_ns,
         )
 
+    def _invalidate_missing_source(self) -> None:
+        """Drop authoritative source state when the selected file disappears so the shell cannot stay falsely Ready."""
+
+        already_invalidated = (
+            self._last_known_snapshot is None
+            and self._current_fingerprint is None
+            and self._source_probe_info is None
+        )
+        self._last_known_snapshot = None
+        self._current_fingerprint = None
+        self._source_probe_info = None
+        self._first_frame_image = None
+        self._last_frame_image = None
+        self._suggested_frequency_band = None
+        self._band_user_edited = False
+        self._drift_assessment = DriftAssessment()
+        self.source_metadata_label.setText("Selected source file is missing.")
+        self.suggested_band_label.setText(
+            "Suggested band unavailable until the source file is available again."
+        )
+        self.apply_suggested_band_button.setEnabled(False)
+        self._set_first_frame_preview(None, "First frame preview unavailable.")
+        self.preflight_report_view.setPlainText("")
+        self._controller.mark_fingerprint_failed()
+        self._update_settings_state()
+        if not already_invalidated:
+            self._append_log(
+                "Selected source file is no longer available. Readiness was cleared until the source is reloaded or becomes available again."
+            )
+
     def _choose_source(self) -> None:
         path_text, _ = QFileDialog.getOpenFileName(
             self,
@@ -1639,12 +1669,24 @@ class MainWindow(QMainWindow):
     def _poll_source_staleness(self) -> None:
         if self._render_supervisor is not None:
             return
-        if self._current_source_path is None or self._last_known_snapshot is None:
+        if self._current_source_path is None:
             return
         if not self._current_source_path.exists():
+            self._invalidate_missing_source()
             return
         current_snapshot = self._current_snapshot()
         if current_snapshot is None:
+            return
+        if self._last_known_snapshot is None:
+            self._last_known_snapshot = current_snapshot
+            self._controller.load_source(current_snapshot)
+            self._append_log(
+                "Source file became available again. Probe, fingerprint, and drift review were restarted for the current path."
+            )
+            self._start_source_probe()
+            self._start_fingerprint()
+            self._start_frame_extraction()
+            self._update_settings_state()
             return
         if detect_stale_source(self._last_known_snapshot, current_snapshot):
             self._last_known_snapshot = current_snapshot
@@ -1851,6 +1893,10 @@ class MainWindow(QMainWindow):
     def _build_shell_preflight_report(self):
         if self._current_source_path is None or self._source_probe_info is None:
             raise RuntimeError("Load a source and wait for fast probe metadata before dry-run validation.")
+        if not self._current_source_path.exists():
+            raise RuntimeError(
+                "Selected source file is no longer available. Reload the source before dry-run validation."
+            )
         if self._current_fingerprint is None:
             raise RuntimeError("Canonical fingerprinting must complete before dry-run validation.")
 
@@ -2559,8 +2605,12 @@ class MainWindow(QMainWindow):
         return summary
 
     def _build_render_request(self) -> RenderRequest:
-        if self._current_source_path is None or not self._current_source_path.exists():
+        if self._current_source_path is None:
             raise RuntimeError("Choose a source video before starting a render.")
+        if not self._current_source_path.exists():
+            raise RuntimeError(
+                "Selected source file is no longer available. Reload the source before starting a render."
+            )
         if self._current_fingerprint is None:
             raise RuntimeError(
                 "Canonical fingerprinting must complete before render can start."
@@ -2932,3 +2982,44 @@ class MainWindow(QMainWindow):
             self._render_supervisor.close()
             self._render_supervisor = None
         super().closeEvent(event)
+
+# ######################################################################################################################
+#
+#
+#                                         AAAAAAAA
+#                                       AAAA    AAAAA              AAAAAAAA
+#                                     AAA          AAA           AAAA    AAA
+#                                     AA            AA          AAA       AAA
+#                                     AA            AAAAAAAAAA  AAA       AAAAAAAAAA
+#                                     AAA                  AAA  AAA               AA
+#                                      AAA                AAA    AAAAA            AA
+#                                       AAAAA            AAA        AAA           AA
+#                                          AAA          AAA                       AA
+#                                          AAA         AAA                        AA
+#                                          AA         AAA                         AA
+#                                          AA        AAA                          AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AA                   AAAAAAAAAAAAAA     AA
+#                                         AA  AAAAAAAAAAAAAAAAAAAAAAAA    AAAAAAA AA
+#                                        AAAAAAAAAAA                           AA AA
+#                                                                            AAA  AA
+#                                                                          AAAA   AA
+#                                                                       AAAA      AA
+#                                                                    AAAAA        AA
+#                                                                AAAAA            AA
+#                                                             AAAAA               AA
+#                                                         AAAAAA                  AA
+#                                                     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+#
+#
+# ######################################################################################################################
+#
+#                                                 Copyright (c) JoeShade
+#                               Licensed under the GNU Affero General Public License v3.0
+#
+# ######################################################################################################################
+#
+#                                         +44 (0) 7356 042702 | joe@jshade.co.uk
+#
+# ######################################################################################################################

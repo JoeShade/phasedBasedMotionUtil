@@ -1,4 +1,4 @@
-"""This file provides a small worker process scaffold used by tests and future render integration to exercise the documented spawn + socket supervision model."""
+"""This file provides a small test worker scaffold so the IPC and supervision contract can be exercised without invoking the real render engine."""
 
 from __future__ import annotations
 
@@ -208,3 +208,44 @@ def worker_process_main(config: WorkerLaunchConfig, cancel_event: EventType) -> 
         )
     )
     settle_and_exit(config.behavior.exit_code)
+
+# ######################################################################################################################
+#
+#
+#                                         AAAAAAAA
+#                                       AAAA    AAAAA              AAAAAAAA
+#                                     AAA          AAA           AAAA    AAA
+#                                     AA            AA          AAA       AAA
+#                                     AA            AAAAAAAAAA  AAA       AAAAAAAAAA
+#                                     AAA                  AAA  AAA               AA
+#                                      AAA                AAA    AAAAA            AA
+#                                       AAAAA            AAA        AAA           AA
+#                                          AAA          AAA                       AA
+#                                          AAA         AAA                        AA
+#                                          AA         AAA                         AA
+#                                          AA        AAA                          AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AA                   AAAAAAAAAAAAAA     AA
+#                                         AA  AAAAAAAAAAAAAAAAAAAAAAAA    AAAAAAA AA
+#                                        AAAAAAAAAAA                           AA AA
+#                                                                            AAA  AA
+#                                                                          AAAA   AA
+#                                                                       AAAA      AA
+#                                                                    AAAAA        AA
+#                                                                AAAAA            AA
+#                                                             AAAAA               AA
+#                                                         AAAAAA                  AA
+#                                                     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+#
+#
+# ######################################################################################################################
+#
+#                                                 Copyright (c) JoeShade
+#                               Licensed under the GNU Affero General Public License v3.0
+#
+# ######################################################################################################################
+#
+#                                         +44 (0) 7356 042702 | joe@jshade.co.uk
+#
+# ######################################################################################################################

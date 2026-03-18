@@ -10,12 +10,21 @@ from pathlib import Path
 
 from phase_motion_app.core.toolchain import resolve_toolchain
 
-def _parse_fraction(value: str) -> float:
-    numerator_text, denominator_text = value.split("/", 1)
-    numerator = float(numerator_text)
-    denominator = float(denominator_text)
+
+def _parse_fraction(value: str | None, default: float = 0.0) -> float:
+    if value in {None, "", "N/A"}:
+        return default
+    separator = "/" if "/" in value else ":" if ":" in value else None
+    if separator is None:
+        return _parse_float(value, default)
+    numerator_text, denominator_text = value.split(separator, 1)
+    try:
+        numerator = float(numerator_text)
+        denominator = float(denominator_text)
+    except (TypeError, ValueError):
+        return default
     if denominator == 0:
-        return 0.0
+        return default
     return numerator / denominator
 
 
@@ -128,14 +137,23 @@ def parse_ffprobe_json(payload: dict) -> FfprobeMediaInfo:
     """Parse ffprobe JSON using a conservative CFR rule: if the rates disagree or are missing, treat the source as not safely CFR."""
 
     video_stream = next(
-        stream for stream in payload["streams"] if stream.get("codec_type") == "video"
+        (stream for stream in payload.get("streams", []) if stream.get("codec_type") == "video"),
+        None,
     )
+    if video_stream is None:
+        raise ValueError("ffprobe payload did not contain a video stream.")
     audio_stream_count = sum(
-        1 for stream in payload["streams"] if stream.get("codec_type") == "audio"
+        1
+        for stream in payload.get("streams", [])
+        if stream.get("codec_type") == "audio"
     )
     r_frame_rate = _parse_fraction(video_stream.get("r_frame_rate", "0/0"))
     avg_frame_rate = _parse_fraction(video_stream.get("avg_frame_rate", "0/0"))
-    is_cfr = r_frame_rate > 0 and avg_frame_rate > 0 and abs(r_frame_rate - avg_frame_rate) < 1e-6
+    is_cfr = (
+        r_frame_rate > 0
+        and avg_frame_rate > 0
+        and abs(r_frame_rate - avg_frame_rate) < 1e-6
+    )
     bit_depth_text = (
         video_stream.get("bits_per_raw_sample")
         or video_stream.get("bits_per_sample")
@@ -182,3 +200,44 @@ def parse_ffprobe_json(payload: dict) -> FfprobeMediaInfo:
         rotation_degrees=rotation_degrees,
         sample_aspect_ratio=sample_aspect_ratio,
     )
+
+# ######################################################################################################################
+#
+#
+#                                         AAAAAAAA
+#                                       AAAA    AAAAA              AAAAAAAA
+#                                     AAA          AAA           AAAA    AAA
+#                                     AA            AA          AAA       AAA
+#                                     AA            AAAAAAAAAA  AAA       AAAAAAAAAA
+#                                     AAA                  AAA  AAA               AA
+#                                      AAA                AAA    AAAAA            AA
+#                                       AAAAA            AAA        AAA           AA
+#                                          AAA          AAA                       AA
+#                                          AAA         AAA                        AA
+#                                          AA         AAA                         AA
+#                                          AA        AAA                          AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AA                   AAAAAAAAAAAAAA     AA
+#                                         AA  AAAAAAAAAAAAAAAAAAAAAAAA    AAAAAAA AA
+#                                        AAAAAAAAAAA                           AA AA
+#                                                                            AAA  AA
+#                                                                          AAAA   AA
+#                                                                       AAAA      AA
+#                                                                    AAAAA        AA
+#                                                                AAAAA            AA
+#                                                             AAAAA               AA
+#                                                         AAAAAA                  AA
+#                                                     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+#
+#
+# ######################################################################################################################
+#
+#                                                 Copyright (c) JoeShade
+#                               Licensed under the GNU Affero General Public License v3.0
+#
+# ######################################################################################################################
+#
+#                                         +44 (0) 7356 042702 | joe@jshade.co.uk
+#
+# ######################################################################################################################

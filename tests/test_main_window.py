@@ -8,6 +8,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
@@ -626,6 +628,128 @@ def test_main_window_restarts_probe_and_fingerprint_when_source_goes_stale(
     assert window._current_fingerprint is None
     assert window._source_probe_info is None
     assert calls == {"probe": 1, "fingerprint": 1, "frames": 1}
+
+
+def test_main_window_invalidates_ready_state_when_source_goes_missing(
+    tmp_path: Path,
+) -> None:
+    app = _app()
+    window = _ready_window(tmp_path)
+    source_path = window._current_source_path
+    assert source_path is not None
+    calls = {"probe": 0, "fingerprint": 0, "frames": 0}
+    window._start_source_probe = lambda: calls.__setitem__("probe", calls["probe"] + 1)
+    window._start_fingerprint = lambda: calls.__setitem__(
+        "fingerprint", calls["fingerprint"] + 1
+    )
+    window._start_frame_extraction = lambda: calls.__setitem__(
+        "frames", calls["frames"] + 1
+    )
+
+    try:
+        source_path.unlink()
+        window._poll_source_staleness()
+
+        assert window._controller.state is UiState.LOADED
+        assert window._current_fingerprint is None
+        assert window._source_probe_info is None
+        assert window.source_metadata_label.text() == "Selected source file is missing."
+        assert window.start_render_button.isEnabled() is False
+
+        source_path.write_bytes(b"source-returned")
+        window._poll_source_staleness()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert window._controller.state is UiState.FINGERPRINT_PENDING
+    assert calls == {"probe": 1, "fingerprint": 1, "frames": 1}
+
+
+def test_main_window_dry_run_rejects_missing_source_even_before_stale_poll(
+    tmp_path: Path,
+) -> None:
+    app = _app()
+    window = _ready_window(tmp_path)
+    source_path = window._current_source_path
+    assert source_path is not None
+
+    try:
+        source_path.unlink()
+        with pytest.raises(RuntimeError, match="no longer available"):
+            window._build_shell_preflight_report()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+
+def test_main_window_missing_source_poll_does_not_repeat_log_noise(
+    tmp_path: Path,
+) -> None:
+    app = _app()
+    window = _ready_window(tmp_path)
+    source_path = window._current_source_path
+    assert source_path is not None
+
+    try:
+        source_path.unlink()
+        window._poll_source_staleness()
+        first_log = window.event_log.toPlainText()
+        window._poll_source_staleness()
+        second_log = window.event_log.toPlainText()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    marker = "Selected source file is no longer available."
+    assert first_log.count(marker) == 1
+    assert second_log.count(marker) == 1
+
+
+def test_main_window_start_render_warns_and_skips_supervisor_when_source_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = _app()
+    warnings: list[str] = []
+    supervisor_calls = 0
+
+    def fake_warning(_parent, _title, message) -> None:
+        warnings.append(str(message))
+
+    def fake_supervisor_factory(_request):
+        nonlocal supervisor_calls
+        supervisor_calls += 1
+        return FakeSupervisor([])
+
+    monkeypatch.setattr(main_window_module.QMessageBox, "warning", fake_warning)
+    window = _ready_window(
+        tmp_path,
+        render_supervisor_factory=fake_supervisor_factory,
+    )
+    source_path = window._current_source_path
+    assert source_path is not None
+
+    try:
+        source_path.unlink()
+        window._start_render()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert warnings == [
+        "Selected source file is no longer available. Reload the source before starting a render."
+    ]
+    assert supervisor_calls == 0
+    assert window._controller.state is UiState.READY
 
 
 def test_main_window_ignores_persisted_output_folder_for_startup_default(
@@ -1544,3 +1668,44 @@ def test_main_window_purges_only_failed_run_temp_files(tmp_path: Path) -> None:
     assert not failed_scratch.exists()
     assert completed_diag.exists()
     assert completed_scratch.exists()
+
+# ######################################################################################################################
+#
+#
+#                                         AAAAAAAA
+#                                       AAAA    AAAAA              AAAAAAAA
+#                                     AAA          AAA           AAAA    AAA
+#                                     AA            AA          AAA       AAA
+#                                     AA            AAAAAAAAAA  AAA       AAAAAAAAAA
+#                                     AAA                  AAA  AAA               AA
+#                                      AAA                AAA    AAAAA            AA
+#                                       AAAAA            AAA        AAA           AA
+#                                          AAA          AAA                       AA
+#                                          AAA         AAA                        AA
+#                                          AA         AAA                         AA
+#                                          AA        AAA                          AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AAA       AAAAAAAAA                     AA
+#                                         AA                   AAAAAAAAAAAAAA     AA
+#                                         AA  AAAAAAAAAAAAAAAAAAAAAAAA    AAAAAAA AA
+#                                        AAAAAAAAAAA                           AA AA
+#                                                                            AAA  AA
+#                                                                          AAAA   AA
+#                                                                       AAAA      AA
+#                                                                    AAAAA        AA
+#                                                                AAAAA            AA
+#                                                             AAAAA               AA
+#                                                         AAAAAA                  AA
+#                                                     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+#
+#
+# ######################################################################################################################
+#
+#                                                 Copyright (c) JoeShade
+#                               Licensed under the GNU Affero General Public License v3.0
+#
+# ######################################################################################################################
+#
+#                                         +44 (0) 7356 042702 | joe@jshade.co.uk
+#
+# ######################################################################################################################

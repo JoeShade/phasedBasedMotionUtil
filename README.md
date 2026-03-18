@@ -1,47 +1,82 @@
 # Phase-based Motion Amplification Desktop Utility
 
-This repository contains a Python + PyQt6 desktop application for offline-only phase-based motion amplification. The implementation follows `systemDesign.md` as the primary design source.
+This repository contains the current Python desktop implementation of the Phase-based Motion Amplification Utility. It is a PyQt6 application for offline processing of recorded video with a separate worker process for probe, validation, amplification, quantitative analysis, encoding, diagnostics, and output finalization.
 
-Current implemented slices:
+`systemDesign.md` is the primary design and architecture source of truth. `docs/architecture-notes.md` adds short implementation notes, and `docs/deviations.md` is reserved for temporary code/design mismatches.
 
-- project packaging and test configuration
-- sidecar domain models and schema validation
-- safe sidecar reload that restores only reusable `intent`
-- mandatory pre-flight and storage/finalization policy logic
-- worker IPC, watchdog, diagnostics bundle writing, and spawn-worker integration
-- real render worker using ffmpeg/ffprobe subprocesses and phase-derived amplification
-- bounded decode -> compute -> encode worker pipeline with policy-driven queue depth and helper concurrency
-- fast source probe wiring in the PyQt shell
-- drift-check and exclusion-zone editor with source-frame geometry and frame extraction
-- shell-side render supervision, dry-run validation, terminal cleanup controls, and last-used settings persistence
+## Current capabilities
 
-How to run tests:
+- single-source, single-render desktop workflow
+- fast source probe, canonical source fingerprinting, and first-frame preview
+- drift review plus static source-space mask zones
+- optional quantitative-analysis ROI with render-time artifact export
+- mandatory shell-side and worker-side pre-flight checks
+- separate render worker with loopback IPC, watchdog supervision, and explicit terminal-state rules
+- bounded worker pipeline with decode, phase processing, optional background analysis handoff, encode, staged validation, and paired MP4/JSON finalization
+- diagnostics bundle writing, retained-failure cleanup, and last-used convenience settings
 
-```powershell
-python -m pip install -e .[dev]
-python -m pytest
-```
+## Constraints and non-goals
 
-How to start the app:
+- offline processing only
+- phase-based amplification only
+- one active render at a time
+- MP4 output only, audio stripped
+- downscale-only output policy
+- no live mode
+- no full amplified preview mode
+- no batch queue
+- no analysis-only mode
+
+## Install and run
+
+Runtime install:
 
 ```powershell
 python -m pip install -e .
 phase-motion-app
 ```
 
-Persisted convenience state is stored under `~/.phase_motion_app/` by default. When you run from a source checkout, repo-local temp workspaces now stay under `./temp/` and diagnostics stay under `./diagnostics/`. Final MP4 and sidecar files are still written to the selected output folder.
-
-Resource-policy presets now affect actual worker execution behavior:
-- `Conservative`: smallest chunk caps and shallowest queues
-- `Balanced`: moderate helper fan-out with bounded queueing
-- `Aggressive`: larger chunk caps, deeper bounded queues, and higher warp/motion helper counts when cores allow
-
-Developer perf-smoke:
+Windows source-checkout launcher:
 
 ```powershell
-python tools/perf_smoke_phase_pipeline.py --frames 32 --width 192 --height 192 --repetitions 3
+.\run.bat
 ```
 
-That script profiles synthetic phase chunks and prints the applied scheduler plan plus motion-estimation, warp, process-chunk, and analysis-handoff timings for the selected resource policies.
+Developer install:
 
-Known deviations from the design are tracked in [docs/deviations.md](docs/deviations.md).
+```powershell
+python -m pip install -e .[dev]
+```
+
+The project depends on `PyQt6`, `numpy`, `jsonschema`, `psutil`, and `static-ffmpeg`. The worker resolves `ffmpeg` and `ffprobe` through `static-ffmpeg` unless `PHASE_MOTION_FFMPEG` and `PHASE_MOTION_FFPROBE` are both set explicitly.
+
+## Tests
+
+Run the full suite:
+
+```powershell
+python -m pytest
+```
+
+During development, run targeted tests for touched modules first and the full suite before finalizing.
+
+## Repository layout
+
+- `src/phase_motion_app/app`: PyQt shell, dialogs, shell-side validation, worker supervision, and UI state management
+- `src/phase_motion_app/core`: testable domain logic, models, pre-flight, sidecars, masking, diagnostics, storage, watchdog, and media helpers
+- `src/phase_motion_app/worker`: spawned worker bootstrap plus the render worker implementation
+- `tests`: unit and integration-style tests
+- `tools`: developer-only scripts such as the synthetic pipeline perf smoke
+
+## Runtime paths
+
+When launched from a source checkout, the app uses repo-local `input/`, `output/`, `temp/`, and `diagnostics/` directories by default so development runs stay self-contained. User-level convenience state still lives under `~/.phase_motion_app/settings.json` unless a test or caller overrides the state path.
+
+Diagnostics are written under the configured diagnostics root, and successful exports are committed only when both the final MP4 and matching JSON sidecar are in place.
+
+## Supporting docs
+
+- [systemDesign.md](systemDesign.md)
+- [docs/architecture-notes.md](docs/architecture-notes.md)
+- [docs/deviations.md](docs/deviations.md)
+- [PARALLELIZATION_ANALYSIS.md](PARALLELIZATION_ANALYSIS.md)
