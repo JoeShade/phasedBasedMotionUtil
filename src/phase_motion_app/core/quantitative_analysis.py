@@ -458,6 +458,13 @@ class StreamingQuantitativeAnalyzer:
             high_hz=self._high_hz,
             roi_cell_records=roi_cell_records,
         )
+        roi_trace = _aggregate_roi_trace(roi_cell_records)
+        band_activity_traces = _build_band_activity_traces(
+            roi_trace=roi_trace,
+            frequencies=frequencies,
+            bands=bands,
+            fps=self._fps,
+        )
         heatmaps, heatmap_scale = _build_heatmaps(
             base_cells=self._base_cells,
             base_spectra=base_spectra,
@@ -468,7 +475,6 @@ class StreamingQuantitativeAnalyzer:
             roi_cell_records=roi_cell_records,
             low_confidence_threshold=self._settings.low_confidence_threshold,
         )
-        roi_trace = _aggregate_roi_trace(roi_cell_records)
         artifact_paths = _write_analysis_artifacts(
             output_directory=output_directory,
             roi_mode=self._roi_mode,
@@ -480,6 +486,7 @@ class StreamingQuantitativeAnalyzer:
             reported_peaks=reported_peaks,
             roi_cell_records=roi_cell_records,
             bands=bands,
+            band_activity_traces=band_activity_traces,
             heatmaps=heatmaps,
             heatmap_scale=heatmap_scale,
             fps=self._fps,
@@ -1126,6 +1133,109 @@ def _aggregate_roi_trace(roi_cell_records: tuple[_RoiCellRecord, ...]) -> np.nda
             axis=0,
         ).astype(np.float32, copy=False)
     return np.zeros(1, dtype=np.float32)
+
+
+def _build_band_activity_traces(
+    *,
+    roi_trace: np.ndarray,
+    frequencies: np.ndarray,
+    bands: tuple[_GeneratedBand, ...],
+    fps: float,
+) -> dict[str, np.ndarray]:
+    """Build one non-negative activity envelope per resolved band from the ROI trace."""
+
+    if roi_trace.size <= 0 or not bands:
+        return {}
+    centered_trace = roi_trace.astype(np.float32, copy=False) - np.float32(roi_trace.mean())
+    spectrum = np.fft.rfft(centered_trace)
+    band_activity_traces: dict[str, np.ndarray] = {}
+    for band in bands:
+        band_activity_traces[band.band_id] = _build_single_band_activity_trace(
+            centered_trace=centered_trace,
+            spectrum=spectrum,
+            frequencies=frequencies,
+            band=band,
+            fps=fps,
+        )
+    return band_activity_traces
+
+
+def _build_single_band_activity_trace(
+    *,
+    centered_trace: np.ndarray,
+    spectrum: np.ndarray,
+    frequencies: np.ndarray,
+    band: _GeneratedBand,
+    fps: float,
+) -> np.ndarray:
+    """Isolate one resolved band in the FFT domain and smooth it into a readable activity curve."""
+
+    if centered_trace.size <= 0:
+        return np.zeros(1, dtype=np.float32)
+    band_mask = (frequencies >= band.low_hz) & (frequencies <= band.high_hz)
+    if int(np.count_nonzero(band_mask)) <= 0:
+        return np.zeros(centered_trace.shape[0], dtype=np.float32)
+    isolated_spectrum = np.zeros_like(spectrum)
+    isolated_spectrum[band_mask] = spectrum[band_mask]
+    band_limited = np.fft.irfft(isolated_spectrum, n=centered_trace.shape[0]).astype(
+        np.float32,
+        copy=False,
+    )
+    window_frames = _band_activity_window_frames(
+        band=band,
+        fps=fps,
+        trace_length=centered_trace.shape[0],
+    )
+    return _moving_rms_envelope(band_limited, window_frames=window_frames)
+
+
+def _band_activity_window_frames(
+    *,
+    band: _GeneratedBand,
+    fps: float,
+    trace_length: int,
+) -> int:
+    """Choose a short deterministic smoothing window so the plot shows bursts, not raw carrier oscillation."""
+
+    center_hz = (
+        band.source_peak_hz
+        if band.source_peak_hz is not None
+        else max((band.low_hz + band.high_hz) / 2.0, 0.1)
+    )
+    # Half of the dominant period is a stable compromise here: it removes the
+    # sign-flipping carrier while still tracking slower changes in band energy.
+    window_seconds = float(np.clip(0.5 / max(center_hz, 0.25), 0.08, 0.35))
+    window_frames = max(3, int(round(window_seconds * max(fps, 1e-6))))
+    if trace_length > 1:
+        max_window = trace_length if trace_length % 2 == 1 else trace_length - 1
+        window_frames = min(window_frames, max(max_window, 1))
+    if window_frames < 3:
+        return min(max(trace_length, 1), 3)
+    if window_frames % 2 == 0:
+        window_frames = max(3, window_frames - 1)
+    return window_frames
+
+
+def _moving_rms_envelope(trace: np.ndarray, *, window_frames: int) -> np.ndarray:
+    """Return a same-length RMS envelope for one band-limited trace."""
+
+    if trace.size <= 0:
+        return np.zeros(1, dtype=np.float32)
+    if window_frames <= 1 or trace.size == 1:
+        return np.abs(trace).astype(np.float32, copy=False)
+    clipped_window = min(
+        window_frames,
+        trace.shape[0] if trace.shape[0] % 2 == 1 else max(trace.shape[0] - 1, 1),
+    )
+    if clipped_window <= 1:
+        return np.abs(trace).astype(np.float32, copy=False)
+    kernel = np.full(clipped_window, np.float32(1.0 / clipped_window), dtype=np.float32)
+    smoothed_power = np.convolve(
+        np.square(trace.astype(np.float32, copy=False)),
+        kernel,
+        mode="same",
+    ).astype(np.float32, copy=False)
+    return np.sqrt(np.maximum(smoothed_power, 0.0)).astype(np.float32, copy=False)
 
 
 def _amplitude_spectrum(trace: np.ndarray) -> np.ndarray:
@@ -2220,6 +2330,7 @@ def _write_analysis_artifacts(
     reported_peaks: tuple[_PeakRecord, ...],
     roi_cell_records: tuple[_RoiCellRecord, ...],
     bands: tuple[_GeneratedBand, ...],
+    band_activity_traces: dict[str, np.ndarray],
     heatmaps: dict[str, dict[str, Any]],
     heatmap_scale: dict[str, Any],
     fps: float,
@@ -2286,6 +2397,26 @@ def _write_analysis_artifacts(
         for frame_index, value in enumerate(roi_trace):
             writer.writerow([frame_index, f"{frame_index / fps:.6f}", f"{float(value):.8f}"])
     artifact_paths["roi_trace"] = str(trace_path)
+
+    if bands and band_activity_traces:
+        band_activity_csv_path = output_directory / "band_activity_vs_time.csv"
+        _write_band_activity_csv(
+            path=band_activity_csv_path,
+            band_activity_traces=band_activity_traces,
+            bands=bands,
+            fps=fps,
+        )
+        artifact_paths["band_activity_vs_time_csv"] = str(band_activity_csv_path)
+
+        band_activity_path = output_directory / "band_activity_vs_time.png"
+        band_activity_image = _render_band_activity_figure(
+            band_activity_traces=band_activity_traces,
+            bands=bands,
+            fps=fps,
+            roi_label=roi_label,
+        )
+        _write_png(band_activity_path, band_activity_image)
+        artifact_paths["band_activity_vs_time_png"] = str(band_activity_path)
 
     traces_path = output_directory / "cell_traces.csv"
     with traces_path.open("w", encoding="utf-8", newline="") as handle:
@@ -2574,6 +2705,215 @@ def _render_heatmap_figure(
     return canvas
 
 
+def _render_band_activity_figure(
+    *,
+    band_activity_traces: dict[str, np.ndarray],
+    bands: tuple[_GeneratedBand, ...],
+    fps: float,
+    roi_label: str,
+) -> np.ndarray:
+    """Render a deterministic PNG chart that shows one resolved-band activity trace per line."""
+
+    canvas_height = 560
+    canvas_width = 960
+    margin = 20
+    title_scale = 3
+    body_scale = 2
+    line_height = (5 * body_scale) + body_scale
+    title_height = (5 * title_scale) + title_scale
+    plot_left = 84
+    plot_top = 72
+    plot_width = 620
+    plot_height = 330
+    legend_left = plot_left + plot_width + 24
+    legend_top = plot_top + 24
+    canvas = np.full((canvas_height, canvas_width, 3), 248, dtype=np.uint8)
+    plot_right = plot_left + plot_width
+    plot_bottom = plot_top + plot_height
+    canvas[plot_top:plot_bottom, plot_left:plot_right] = 255
+
+    grid_color = np.array([224, 224, 224], dtype=np.uint8)
+    axis_color = np.array([70, 70, 70], dtype=np.uint8)
+    text_color = np.array([32, 32, 32], dtype=np.uint8)
+    muted_text_color = np.array([78, 78, 78], dtype=np.uint8)
+
+    title = "BAND ACTIVITY VS TIME"
+    _draw_bitmap_text(
+        canvas,
+        title,
+        top=margin,
+        left=max(margin, (canvas_width - _measure_bitmap_text(title, title_scale)) // 2),
+        color=text_color,
+        scale=title_scale,
+    )
+    subtitle = f"ROI {roi_label.upper()}"
+    _draw_bitmap_text(
+        canvas,
+        subtitle,
+        top=margin + title_height + 6,
+        left=max(margin, (canvas_width - _measure_bitmap_text(subtitle, body_scale)) // 2),
+        color=muted_text_color,
+        scale=body_scale,
+    )
+    _draw_bitmap_text(
+        canvas,
+        "BAND ACTIVITY",
+        top=plot_top - (line_height + 6),
+        left=plot_left,
+        color=muted_text_color,
+        scale=body_scale,
+    )
+
+    _draw_rect_outline(
+        canvas,
+        top=plot_top,
+        left=plot_left,
+        height=plot_height,
+        width=plot_width,
+        color=axis_color,
+    )
+
+    y_tick_count = 5
+    x_tick_count = 5
+    max_activity = max(
+        (float(np.max(trace)) for trace in band_activity_traces.values() if trace.size > 0),
+        default=0.0,
+    )
+    if max_activity <= 1e-8:
+        max_activity = 1.0
+    frame_count = max((trace.shape[0] for trace in band_activity_traces.values()), default=1)
+    duration_seconds = max(0.0, (frame_count - 1) / max(fps, 1e-6))
+
+    for tick_index in range(y_tick_count):
+        fraction = 0.0 if y_tick_count <= 1 else tick_index / (y_tick_count - 1)
+        y = plot_bottom - 1 - int(round(fraction * (plot_height - 1)))
+        if plot_left + 1 < plot_right - 1:
+            canvas[y : y + 1, plot_left + 1 : plot_right - 1] = grid_color
+        tick_value = fraction * max_activity
+        label = _format_plot_value(tick_value)
+        _draw_bitmap_text(
+            canvas,
+            label,
+            top=y - (line_height // 2),
+            left=max(margin, plot_left - _measure_bitmap_text(label, body_scale) - 10),
+            color=muted_text_color,
+            scale=body_scale,
+        )
+
+    for tick_index in range(x_tick_count):
+        fraction = 0.0 if x_tick_count <= 1 else tick_index / (x_tick_count - 1)
+        x = plot_left + int(round(fraction * (plot_width - 1)))
+        if plot_top + 1 < plot_bottom - 1:
+            canvas[plot_top + 1 : plot_bottom - 1, x : x + 1] = grid_color
+        label = _format_plot_value(fraction * duration_seconds)
+        label_left = max(
+            margin,
+            min(
+                canvas_width - margin - _measure_bitmap_text(label, body_scale),
+                x - (_measure_bitmap_text(label, body_scale) // 2),
+            ),
+        )
+        _draw_bitmap_text(
+            canvas,
+            label,
+            top=plot_bottom + 8,
+            left=label_left,
+            color=muted_text_color,
+            scale=body_scale,
+        )
+
+    _draw_bitmap_text(
+        canvas,
+        "TIME SECONDS",
+        top=plot_bottom + line_height + 18,
+        left=max(
+            margin,
+            plot_left + (plot_width - _measure_bitmap_text("TIME SECONDS", body_scale)) // 2,
+        ),
+        color=muted_text_color,
+        scale=body_scale,
+    )
+
+    for band_index, band in enumerate(bands):
+        trace = band_activity_traces.get(band.band_id)
+        if trace is None or trace.size <= 0:
+            continue
+        color = _band_plot_color(band_index)
+        normalized_trace = np.clip(trace.astype(np.float32, copy=False) / np.float32(max_activity), 0.0, 1.0)
+        x_positions = np.linspace(plot_left, plot_right - 1, trace.shape[0], dtype=np.float32)
+        y_positions = (plot_bottom - 1) - (normalized_trace * np.float32(plot_height - 1))
+        _draw_polyline(
+            canvas,
+            x_positions=x_positions,
+            y_positions=y_positions,
+            color=color,
+            thickness=2,
+        )
+
+    _draw_bitmap_text(
+        canvas,
+        "BANDS",
+        top=legend_top - (line_height + 2),
+        left=legend_left,
+        color=text_color,
+        scale=body_scale,
+    )
+    for band_index, band in enumerate(bands):
+        legend_y = legend_top + (band_index * (line_height + 12))
+        color = _band_plot_color(band_index)
+        _draw_line_segment(
+            canvas,
+            x0=legend_left,
+            y0=legend_y + (line_height // 2),
+            x1=legend_left + 24,
+            y1=legend_y + (line_height // 2),
+            color=color,
+            thickness=2,
+        )
+        legend_text = f"{band.band_id.upper()} {band.low_hz:.2f}-{band.high_hz:.2f} HZ"
+        legend_lines = _wrap_bitmap_text(
+            legend_text,
+            max_width=canvas_width - legend_left - margin,
+            scale=body_scale,
+        )
+        for line_index, line in enumerate(legend_lines):
+            _draw_bitmap_text(
+                canvas,
+                line,
+                top=legend_y + (line_index * line_height),
+                left=legend_left + 34,
+                color=text_color,
+                scale=body_scale,
+            )
+
+    return canvas
+
+
+def _write_band_activity_csv(
+    *,
+    path: Path,
+    band_activity_traces: dict[str, np.ndarray],
+    bands: tuple[_GeneratedBand, ...],
+    fps: float,
+) -> None:
+    """Write the companion band-activity table in one wide deterministic CSV."""
+
+    frame_count = max(
+        (trace.shape[0] for trace in band_activity_traces.values()),
+        default=0,
+    )
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["frame_index", "time_seconds", *[band.band_id for band in bands]])
+        for frame_index in range(frame_count):
+            row = [frame_index, f"{frame_index / fps:.6f}"]
+            for band in bands:
+                trace = band_activity_traces.get(band.band_id)
+                value = 0.0 if trace is None or frame_index >= trace.shape[0] else float(trace[frame_index])
+                row.append(f"{value:.8f}")
+            writer.writerow(row)
+
+
 def _analysis_display_resolution(*, height: int, width: int) -> tuple[int, int]:
     long_side = max(height, width, 1)
     target_long_side = min(max(long_side, 480), 840)
@@ -2797,6 +3137,14 @@ def _measure_bitmap_text(text: str, scale: int) -> int:
     return (len(sanitized) * ((3 * scale) + scale)) - scale
 
 
+def _format_plot_value(value: float) -> str:
+    if value >= 10.0:
+        return f"{value:.0f}"
+    if value >= 1.0:
+        return f"{value:.1f}"
+    return f"{value:.2f}"
+
+
 def _draw_bitmap_text(
     canvas: np.ndarray,
     text: str,
@@ -2822,6 +3170,92 @@ def _draw_bitmap_text(
                     continue
                 canvas[row_start:row_stop, column_start:column_stop] = color
         cursor_left += (3 * scale) + scale
+
+
+def _draw_rect_outline(
+    canvas: np.ndarray,
+    *,
+    top: int,
+    left: int,
+    height: int,
+    width: int,
+    color: np.ndarray,
+) -> None:
+    bottom = min(canvas.shape[0], top + height)
+    right = min(canvas.shape[1], left + width)
+    if top < 0 or left < 0 or bottom <= top or right <= left:
+        return
+    canvas[top:bottom, left : left + 1] = color
+    canvas[top:bottom, right - 1 : right] = color
+    canvas[top : top + 1, left:right] = color
+    canvas[bottom - 1 : bottom, left:right] = color
+
+
+def _band_plot_color(index: int) -> np.ndarray:
+    palette = (
+        np.array([38, 112, 198], dtype=np.uint8),
+        np.array([224, 122, 48], dtype=np.uint8),
+        np.array([64, 156, 92], dtype=np.uint8),
+        np.array([168, 90, 204], dtype=np.uint8),
+        np.array([204, 76, 72], dtype=np.uint8),
+    )
+    return palette[index % len(palette)]
+
+
+def _draw_polyline(
+    canvas: np.ndarray,
+    *,
+    x_positions: np.ndarray,
+    y_positions: np.ndarray,
+    color: np.ndarray,
+    thickness: int,
+) -> None:
+    if x_positions.size <= 0 or y_positions.size <= 0:
+        return
+    for index in range(x_positions.shape[0] - 1):
+        _draw_line_segment(
+            canvas,
+            x0=int(round(float(x_positions[index]))),
+            y0=int(round(float(y_positions[index]))),
+            x1=int(round(float(x_positions[index + 1]))),
+            y1=int(round(float(y_positions[index + 1]))),
+            color=color,
+            thickness=thickness,
+        )
+
+
+def _draw_line_segment(
+    canvas: np.ndarray,
+    *,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    color: np.ndarray,
+    thickness: int,
+) -> None:
+    step_count = max(abs(x1 - x0), abs(y1 - y0), 1)
+    for amount in np.linspace(0.0, 1.0, step_count + 1, dtype=np.float32):
+        x = int(round(x0 + ((x1 - x0) * float(amount))))
+        y = int(round(y0 + ((y1 - y0) * float(amount))))
+        _paint_square(canvas, x=x, y=y, color=color, radius=max(0, thickness - 1))
+
+
+def _paint_square(
+    canvas: np.ndarray,
+    *,
+    x: int,
+    y: int,
+    color: np.ndarray,
+    radius: int,
+) -> None:
+    top = max(0, y - radius)
+    bottom = min(canvas.shape[0], y + radius + 1)
+    left = max(0, x - radius)
+    right = min(canvas.shape[1], x + radius + 1)
+    if bottom <= top or right <= left:
+        return
+    canvas[top:bottom, left:right] = color
 
 
 def _heatmap_color(normalized: float) -> np.ndarray:

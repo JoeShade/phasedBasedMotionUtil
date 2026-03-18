@@ -13,7 +13,7 @@ import numpy as np
 import phase_motion_app.core.quantitative_analysis as quantitative_analysis_module
 
 from phase_motion_app.core.drift import DriftAssessment
-from phase_motion_app.core.models import AnalysisSettings, Resolution
+from phase_motion_app.core.models import AnalysisBand, AnalysisBandMode, AnalysisSettings, Resolution
 from phase_motion_app.core.models import ExclusionZone, ZoneMode, ZoneShape
 from phase_motion_app.core.quantitative_analysis import StreamingQuantitativeAnalyzer
 from phase_motion_app.core.quantitative_analysis import (
@@ -65,7 +65,14 @@ def test_quantitative_analysis_writes_required_artifacts(tmp_path: Path) -> None
     frames = _synthetic_motion_frames()
     reference_luma = frames.mean(axis=0, dtype=np.float32)[..., 1]
     analyzer = StreamingQuantitativeAnalyzer(
-        settings=AnalysisSettings(export_advanced_files=False),
+        settings=AnalysisSettings(
+            band_mode=AnalysisBandMode.MANUAL_MULTI,
+            manual_bands=(
+                AnalysisBand(band_id="band01", low_hz=1.0, high_hz=2.0),
+                AnalysisBand(band_id="band02", low_hz=2.0, high_hz=4.0),
+            ),
+            export_advanced_files=False,
+        ),
         processing_resolution=Resolution(32, 32),
         fps=12.0,
         low_hz=1.0,
@@ -87,10 +94,36 @@ def test_quantitative_analysis_writes_required_artifacts(tmp_path: Path) -> None
     assert (tmp_path / "analysis_metadata.json").exists()
     assert (tmp_path / "cell_traces.csv").exists()
     assert (tmp_path / "cell_spectra.csv").exists()
+    assert (tmp_path / "band_activity_vs_time.csv").exists()
+    assert (tmp_path / "band_activity_vs_time.png").exists()
     assert any(path.endswith(".png") for path in export.artifact_paths.values())
+    assert "band_activity_vs_time_csv" in export.artifact_paths
+    assert "band_activity_vs_time_png" in export.artifact_paths
     metadata = json.loads((tmp_path / "analysis_metadata.json").read_text(encoding="utf-8"))
     assert metadata["roi_label"] == "Whole-frame ROI"
     assert metadata["heatmap_scale"]["normalization_method"] == "robust_percentile"
+    assert metadata["artifact_paths"]["band_activity_vs_time_csv"].endswith(
+        "band_activity_vs_time.csv"
+    )
+    assert metadata["artifact_paths"]["band_activity_vs_time_png"].endswith(
+        "band_activity_vs_time.png"
+    )
+    with Path(export.artifact_paths["band_activity_vs_time_csv"]).open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        activity_rows = list(csv.reader(handle))
+    assert activity_rows[0] == ["frame_index", "time_seconds", "band01", "band02"]
+    assert len(activity_rows) == frames.shape[0] + 1
+    assert activity_rows[1][0] == "0"
+    assert activity_rows[1][1] == "0.000000"
+    assert activity_rows[-1][0] == str(frames.shape[0] - 1)
+    band01_values = np.array([float(row[2]) for row in activity_rows[1:]], dtype=np.float32)
+    band02_values = np.array([float(row[3]) for row in activity_rows[1:]], dtype=np.float32)
+    assert np.all(band01_values >= 0.0)
+    assert np.all(band02_values >= 0.0)
+    assert not np.allclose(band01_values, band02_values)
     heatmap_png_path = Path(
         next(
             path
@@ -114,6 +147,88 @@ def test_quantitative_analysis_writes_required_artifacts(tmp_path: Path) -> None
     assert bool(np.any(grayscale_pixels))
     assert bool(np.any(colored_pixels))
     assert np.unique(footer_region.reshape(-1, 3), axis=0).shape[0] > 10
+    activity_plot_pixels = _read_png_rgb(Path(export.artifact_paths["band_activity_vs_time_png"]))
+    activity_plot_colored = (
+        (activity_plot_pixels[:, :, 0] != activity_plot_pixels[:, :, 1])
+        | (activity_plot_pixels[:, :, 1] != activity_plot_pixels[:, :, 2])
+    )
+    assert activity_plot_pixels.shape[0] > 200
+    assert activity_plot_pixels.shape[1] > 400
+    assert np.unique(activity_plot_pixels[activity_plot_colored], axis=0).shape[0] >= 2
+
+
+def test_build_band_activity_traces_follow_resolved_band_windows() -> None:
+    fps = 20.0
+    frame_count = 160
+    time_seconds = np.arange(frame_count, dtype=np.float32) / np.float32(fps)
+    low_envelope = np.where(time_seconds < 4.0, 1.0, 0.20).astype(np.float32)
+    high_envelope = np.where(time_seconds >= 4.0, 0.85, 0.15).astype(np.float32)
+    roi_trace = (
+        low_envelope * np.sin(2.0 * np.pi * 1.0 * time_seconds)
+        + high_envelope * np.sin(2.0 * np.pi * 3.0 * time_seconds)
+    ).astype(np.float32)
+    frequencies = quantitative_analysis_module._frequency_axis(frame_count, fps)
+    traces = quantitative_analysis_module._build_band_activity_traces(
+        roi_trace=roi_trace,
+        frequencies=frequencies,
+        bands=(
+            quantitative_analysis_module._GeneratedBand("band01", 0.8, 1.2, "manual", 1.0),
+            quantitative_analysis_module._GeneratedBand("band02", 2.8, 3.2, "manual", 3.0),
+        ),
+        fps=fps,
+    )
+
+    split_index = frame_count // 2
+    assert set(traces) == {"band01", "band02"}
+    assert traces["band01"][:split_index].mean() > traces["band01"][split_index:].mean() * 1.5
+    assert traces["band02"][split_index:].mean() > traces["band02"][:split_index].mean() * 1.5
+
+
+def test_render_band_activity_figure_draws_multiple_colored_lines() -> None:
+    sample_count = 96
+    phase = np.linspace(0.0, 1.0, sample_count, dtype=np.float32)
+    pixels = quantitative_analysis_module._render_band_activity_figure(
+        band_activity_traces={
+            "band01": 0.15 + (0.70 * np.sin(np.pi * phase)),
+            "band02": 0.10 + (0.65 * np.sin(np.pi * phase[::-1])),
+        },
+        bands=(
+            quantitative_analysis_module._GeneratedBand("band01", 1.0, 2.0, "manual", 1.5),
+            quantitative_analysis_module._GeneratedBand("band02", 2.0, 4.0, "manual", 3.0),
+        ),
+        fps=12.0,
+        roi_label="Whole-frame ROI",
+    )
+
+    colored_mask = (
+        (pixels[:, :, 0] != pixels[:, :, 1])
+        | (pixels[:, :, 1] != pixels[:, :, 2])
+    )
+    unique_colors = np.unique(pixels[colored_mask], axis=0)
+
+    assert pixels.shape == (560, 960, 3)
+    assert unique_colors.shape[0] >= 2
+
+
+def test_render_band_activity_figure_handles_single_band() -> None:
+    pixels = quantitative_analysis_module._render_band_activity_figure(
+        band_activity_traces={
+            "band01": np.linspace(0.05, 0.75, 64, dtype=np.float32),
+        },
+        bands=(
+            quantitative_analysis_module._GeneratedBand("band01", 1.0, 1.8, "manual", 1.3),
+        ),
+        fps=12.0,
+        roi_label="Whole-frame ROI",
+    )
+
+    colored_mask = (
+        (pixels[:, :, 0] != pixels[:, :, 1])
+        | (pixels[:, :, 1] != pixels[:, :, 2])
+    )
+
+    assert pixels.shape == (560, 960, 3)
+    assert bool(np.any(colored_mask))
 
 
 def test_background_quantitative_analysis_finalizes_after_bounded_handoff(
@@ -173,6 +288,28 @@ def test_background_quantitative_analysis_surfaces_worker_failure(tmp_path: Path
         raise AssertionError("background failure did not surface in time")
     finally:
         background.close()
+
+
+def test_disabled_or_empty_quantitative_analysis_does_not_claim_band_activity_plot(
+    tmp_path: Path,
+) -> None:
+    disabled = quantitative_analysis_module.build_disabled_analysis_export(AnalysisSettings(enabled=False))
+    empty = quantitative_analysis_module.build_empty_analysis_export(
+        roi=None,
+        roi_mode="whole_frame",
+        roi_label="Whole-frame ROI",
+        warning="No motion samples were accumulated for quantitative analysis.",
+        output_directory=tmp_path,
+    )
+
+    assert "band_activity_vs_time_png" not in disabled.artifact_paths
+    assert "band_activity_vs_time_png" not in disabled.summary["artifact_paths"]
+    assert "band_activity_vs_time_csv" not in disabled.artifact_paths
+    assert "band_activity_vs_time_csv" not in disabled.summary["artifact_paths"]
+    assert "band_activity_vs_time_png" not in empty.artifact_paths
+    assert "band_activity_vs_time_png" not in empty.summary["artifact_paths"]
+    assert "band_activity_vs_time_csv" not in empty.artifact_paths
+    assert "band_activity_vs_time_csv" not in empty.summary["artifact_paths"]
 
 
 def test_quantitative_analysis_confidence_weight_is_chunk_partition_invariant(

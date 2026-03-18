@@ -1509,7 +1509,8 @@ The implemented analysis hierarchy is:
 5. supported-peak detection using valid-cell support fraction
 6. auto-band or manual-band resolution
 7. band-energy heatmaps on the dense analysis grid
-8. fixed-filename artifact export plus sidecar / diagnostics registration
+8. per-band activity-vs-time traces derived from the ROI trace and the resolved analysis bands
+9. fixed-filename artifact export plus sidecar / diagnostics registration
 
 ### 31.4 Quality and Reporting Rules
 
@@ -1540,7 +1541,17 @@ The implemented analysis hierarchy is:
 - Low-confidence cells remain visible in monochrome and are excluded from shared scale fitting
 - All heatmaps in one render share a robust percentile display scale
 
-### 31.7 Artifact Contract
+### 31.7 Band Activity Plot
+
+- Quantitative analysis also exports one shared `band_activity_vs_time.png` artifact
+- Quantitative analysis also exports one shared `band_activity_vs_time.csv` companion table
+- The plot uses the resolved analysis bands from the same run; it does not run a separate post-hoc analysis on the MP4
+- For each resolved band, the worker isolates that band inside the exported ROI trace in the frequency domain, transforms it back to the time domain, and then applies a short deterministic RMS envelope
+- The resulting chart shows time in seconds on the x-axis and band activity on the y-axis, with one colored line per resolved band
+- The legend text records each plotted band by `band_id` and Hz range so the time plot stays aligned with the heatmap artifact set
+- The CSV companion stores the same per-band activity curves in wide form with `frame_index`, `time_seconds`, and one column per resolved `band_id`
+
+### 31.8 Artifact Contract
 
 The worker writes these fixed filenames into the render output directory:
 
@@ -1550,6 +1561,8 @@ The worker writes these fixed filenames into the render output directory:
 - `cell_traces.csv`
 - `cell_spectra.csv`
 - `analysis_metadata.json`
+- `band_activity_vs_time.csv`
+- `band_activity_vs_time.png`
 - `heatmap_<band_id>.csv`
 - `heatmap_<band_id>.png`
 
@@ -1565,7 +1578,7 @@ The sidecar `results.analysis` payload records:
 - suppressed-peak reasons
 - shared heatmap-scale metadata
 
-### 31.8 Failure Boundary
+### 31.9 Failure Boundary
 
 - If the MP4 render succeeds but quantitative-analysis export fails, the run still completes as a render success
 - The worker records the analysis issue as a warning, writes a minimal analysis metadata record when possible, and still finalizes the MP4 + sidecar pair
@@ -1580,6 +1593,11 @@ When analysis is enabled, chunk collection may be handed to one bounded backgrou
 - accepted chunks must be analyzed in original chunk order
 - final analysis export must wait for the queue to drain before sidecar/artifact write
 - background-analysis failure downgrades analysis through the existing warning path; it does not silently disappear
+
+Artifact note:
+
+- `band_activity_vs_time.png` is an ROI-level summary artifact, not a replacement for the dense heatmaps
+- The plot is intended to answer "when was this band active?" while the heatmaps answer "where in the ROI was this band active?"
 
 UI contract:
 
