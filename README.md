@@ -7,6 +7,8 @@
 
 `phase-based-motion-utility` is an offline PyQt6 desktop utility for phase-based motion amplification on recorded video. It provides a desktop shell, a testable core domain layer, and a supervised worker process for the render path so operators can review a clip, configure a narrow amplification workflow, and produce an amplified MP4 with matching metadata.
 
+For background on the underlying method, see [Wadhwa et al. (2013)](https://doi.org/10.1145/2461912.2461966): N. Wadhwa, M. Rubinstein, F. Durand, and W. T. Freeman, "Phase-Based Video Motion Processing," *ACM Transactions on Graphics*, 32(4), Article 80, pp. 1-10.
+
 ## Disclaimer
 
 This project is an engineering and review tool, not a general-purpose video editor. Outputs and analysis artifacts should be reviewed before you rely on them, and the current scope is intentionally limited to a narrow offline workflow.
