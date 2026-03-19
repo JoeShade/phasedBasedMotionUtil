@@ -24,6 +24,7 @@ from phase_motion_app.core.models import (
     AnalysisBandMode,
     AnalysisSettings,
     ExclusionZone,
+    MAX_ANALYSIS_BANDS,
     Resolution,
     ZoneMode,
     ZoneShape,
@@ -1590,7 +1591,7 @@ def _resolve_bands(
                     low_hz=low_hz,
                     high_hz=high_hz,
                 )
-                for band in settings.manual_bands[:5]
+                for band in settings.manual_bands[:MAX_ANALYSIS_BANDS]
             ),
             (),
         )

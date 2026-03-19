@@ -26,6 +26,7 @@ from phase_motion_app.core.models import (
     AnalysisSettings,
     JobIntent,
     ExclusionZone,
+    MAX_ANALYSIS_BANDS,
     PhaseSettings,
     Resolution,
     ResourcePolicy,
@@ -409,6 +410,11 @@ def test_main_window_applies_advanced_analysis_dialog_changes(
                     (False, 7.0, 10.0),
                     (False, 8.0, 11.0),
                     (False, 9.0, 12.0),
+                    (False, 10.0, 13.0),
+                    (False, 11.0, 14.0),
+                    (False, 12.0, 15.0),
+                    (False, 13.0, 16.0),
+                    (False, 14.0, 17.0),
                 ),
             )
 
@@ -442,6 +448,39 @@ def test_main_window_applies_advanced_analysis_dialog_changes(
     assert intent.analysis.manual_bands[0].low_hz == 6.0
     assert intent.analysis.manual_bands[1].high_hz == 9.5
     assert "2 manual bands" in summary_text
+
+
+def test_main_window_accepts_ten_analysis_bands(tmp_path: Path) -> None:
+    app = _app()
+    window = _ready_window(tmp_path)
+
+    try:
+        window.analysis_band_mode_combo.setCurrentIndex(
+            window.analysis_band_mode_combo.findData(AnalysisBandMode.MANUAL_MULTI)
+        )
+        window.high_hz_spin.setValue(20.0)
+        window.analysis_auto_band_count_spin.setValue(MAX_ANALYSIS_BANDS)
+        assert len(window._manual_band_controls) == MAX_ANALYSIS_BANDS
+        for band_index, (enabled_check, low_spin, high_spin) in enumerate(
+            window._manual_band_controls,
+            start=1,
+        ):
+            enabled_check.setChecked(True)
+            low_spin.setValue(5.0 + band_index)
+            high_spin.setValue(5.5 + band_index)
+        intent = window._build_intent()
+        is_valid = window._analysis_settings_valid(intent)
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert intent.analysis.auto_band_count == MAX_ANALYSIS_BANDS
+    assert len(intent.analysis.manual_bands) == MAX_ANALYSIS_BANDS
+    assert intent.analysis.manual_bands[-1].band_id == f"band{MAX_ANALYSIS_BANDS:02d}"
+    assert intent.analysis.manual_bands[-1].low_hz == 15.0
+    assert is_valid is True
 
 
 def test_main_window_defaults_to_repo_local_input_and_output_roots(tmp_path: Path) -> None:

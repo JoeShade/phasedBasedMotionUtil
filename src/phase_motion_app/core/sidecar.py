@@ -10,15 +10,21 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from phase_motion_app.core.models import JobIntent, SidecarDocument
+from phase_motion_app.core.models import (
+    DEFAULT_ANALYSIS_AUTO_BAND_COUNT,
+    JobIntent,
+    MAX_ANALYSIS_BANDS,
+    SidecarDocument,
+)
 
-SCHEMA_VERSION = "1.4.0"
+SCHEMA_VERSION = "1.5.0"
 _SEMVER_PATTERN = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
 _SUPPORTED_OLDER_SCHEMA_VERSIONS = {
     "1.0.0": "schema_version 1.0.0 was accepted through the explicit compatibility path.",
     "1.1.0": "schema_version 1.1.0 was accepted through the explicit compatibility path.",
     "1.2.0": "schema_version 1.2.0 was accepted through the explicit compatibility path.",
     "1.3.0": "schema_version 1.3.0 was accepted through the explicit compatibility path.",
+    "1.4.0": "schema_version 1.4.0 was accepted through the explicit compatibility path.",
 }
 
 # The design doc defines the domains and required safety checks, but it does not
@@ -119,7 +125,7 @@ SIDECAR_SCHEMA_V1: dict[str, Any] = {
                         "auto_band_count": {
                             "type": "integer",
                             "minimum": 1,
-                            "maximum": 5,
+                            "maximum": MAX_ANALYSIS_BANDS,
                         },
                         "band_mode": {
                             "type": "string",
@@ -127,7 +133,7 @@ SIDECAR_SCHEMA_V1: dict[str, Any] = {
                         },
                         "manual_bands": {
                             "type": "array",
-                            "maxItems": 5,
+                            "maxItems": MAX_ANALYSIS_BANDS,
                             "items": {"$ref": "#/$defs/analysis_band"},
                         },
                         "export_advanced_files": {"type": "boolean"},
@@ -520,10 +526,17 @@ def _semantic_validation_errors(data: dict[str, Any]) -> list[str]:
 
     analysis = intent.get("analysis")
     if analysis is not None:
+        auto_band_count = int(
+            analysis.get("auto_band_count", DEFAULT_ANALYSIS_AUTO_BAND_COUNT)
+        )
         manual_bands = analysis.get("manual_bands", [])
-        if len(manual_bands) > 5:
+        if not (1 <= auto_band_count <= MAX_ANALYSIS_BANDS):
             errors.append(
-                "intent.analysis.manual_bands: at most five manual bands are allowed."
+                f"intent.analysis.auto_band_count: must be between 1 and {MAX_ANALYSIS_BANDS}."
+            )
+        if len(manual_bands) > MAX_ANALYSIS_BANDS:
+            errors.append(
+                f"intent.analysis.manual_bands: at most {MAX_ANALYSIS_BANDS} manual bands are allowed."
             )
         for index, band in enumerate(manual_bands):
             if band["high_hz"] <= band["low_hz"]:

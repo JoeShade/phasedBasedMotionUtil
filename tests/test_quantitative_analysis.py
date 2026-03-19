@@ -19,7 +19,7 @@ from phase_motion_app.core.acceleration import (
 )
 from phase_motion_app.core.drift import DriftAssessment
 from phase_motion_app.core.models import AnalysisBand, AnalysisBandMode, AnalysisSettings, Resolution
-from phase_motion_app.core.models import ExclusionZone, ZoneMode, ZoneShape
+from phase_motion_app.core.models import ExclusionZone, MAX_ANALYSIS_BANDS, ZoneMode, ZoneShape
 from phase_motion_app.core.quantitative_analysis import StreamingQuantitativeAnalyzer
 from phase_motion_app.core.quantitative_analysis import (
     BackgroundStreamingQuantitativeAnalyzer,
@@ -1256,6 +1256,35 @@ def test_auto_band_resolution_merges_peaks_without_clear_valley() -> None:
 
     assert len(bands) == 1
     assert merge_steps
+
+
+def test_manual_multi_band_resolution_preserves_ten_requested_bands() -> None:
+    manual_bands = tuple(
+        AnalysisBand(
+            band_id=f"band{index:02d}",
+            low_hz=1.0 + index,
+            high_hz=1.4 + index,
+        )
+        for index in range(1, MAX_ANALYSIS_BANDS + 1)
+    )
+
+    bands, merge_steps = quantitative_analysis_module._resolve_bands(
+        settings=AnalysisSettings(
+            band_mode=AnalysisBandMode.MANUAL_MULTI,
+            manual_bands=manual_bands,
+        ),
+        roi_spectrum=np.zeros(32, dtype=np.float32),
+        frequencies=np.linspace(0.0, 20.0, 32, dtype=np.float32),
+        reported_peaks=(),
+        low_hz=1.0,
+        high_hz=20.0,
+    )
+
+    assert not merge_steps
+    assert len(bands) == MAX_ANALYSIS_BANDS
+    assert bands[-1].band_id == f"band{MAX_ANALYSIS_BANDS:02d}"
+    assert bands[-1].low_hz == manual_bands[-1].low_hz
+    assert bands[-1].high_hz == manual_bands[-1].high_hz
 
 
 def test_roi_cell_records_ignore_zero_weight_averages() -> None:

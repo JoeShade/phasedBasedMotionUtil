@@ -46,6 +46,10 @@ class AnalysisBandMode(str, Enum):
     MANUAL_MULTI = "manual_multi"
 
 
+DEFAULT_ANALYSIS_AUTO_BAND_COUNT = 5
+MAX_ANALYSIS_BANDS = 10
+
+
 @dataclass(frozen=True)
 class Resolution:
     """This small value object keeps width and height paired so downscale-only checks stay simple."""
@@ -169,7 +173,7 @@ class AnalysisSettings:
     minimum_cell_support_fraction: float = 0.35
     roi_quality_cutoff: float = 0.45
     low_confidence_threshold: float = 0.35
-    auto_band_count: int = 5
+    auto_band_count: int = DEFAULT_ANALYSIS_AUTO_BAND_COUNT
     band_mode: AnalysisBandMode = AnalysisBandMode.AUTO
     manual_bands: tuple[AnalysisBand, ...] = field(default_factory=tuple)
     export_advanced_files: bool = True
@@ -201,7 +205,9 @@ class AnalysisSettings:
             ),
             roi_quality_cutoff=float(data.get("roi_quality_cutoff", 0.45)),
             low_confidence_threshold=float(data.get("low_confidence_threshold", 0.35)),
-            auto_band_count=int(data.get("auto_band_count", 5)),
+            auto_band_count=int(
+                data.get("auto_band_count", DEFAULT_ANALYSIS_AUTO_BAND_COUNT)
+            ),
             band_mode=AnalysisBandMode(
                 data.get("band_mode", AnalysisBandMode.AUTO.value)
             ),

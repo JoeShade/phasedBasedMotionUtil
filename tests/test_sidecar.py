@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from phase_motion_app.core.models import ResourcePolicy, ZoneMode
+from phase_motion_app.core.models import MAX_ANALYSIS_BANDS, ResourcePolicy, ZoneMode
 from phase_motion_app.core.sidecar import (
     SCHEMA_VERSION,
     SidecarValidationError,
@@ -164,7 +164,7 @@ def test_sidecar_schema_validation_accepts_quantitative_analysis_metadata() -> N
         "minimum_cell_support_fraction": 0.35,
         "roi_quality_cutoff": 0.45,
         "low_confidence_threshold": 0.35,
-        "auto_band_count": 5,
+        "auto_band_count": MAX_ANALYSIS_BANDS,
         "band_mode": "auto",
         "manual_bands": [],
         "export_advanced_files": True,
@@ -198,6 +198,59 @@ def test_sidecar_schema_validation_accepts_quantitative_analysis_metadata() -> N
     validation = validate_sidecar_data(sidecar)
 
     assert validation.status == "valid"
+
+
+def test_sidecar_schema_validation_accepts_ten_manual_analysis_bands() -> None:
+    sidecar = _valid_sidecar()
+    sidecar["intent"]["analysis"] = {
+        "enabled": True,
+        "roi": None,
+        "minimum_cell_support_fraction": 0.35,
+        "roi_quality_cutoff": 0.45,
+        "low_confidence_threshold": 0.35,
+        "auto_band_count": MAX_ANALYSIS_BANDS,
+        "band_mode": "manual_multi",
+        "manual_bands": [
+            {
+                "band_id": f"band{index:02d}",
+                "low_hz": 5.0 + index,
+                "high_hz": 5.5 + index,
+            }
+            for index in range(1, MAX_ANALYSIS_BANDS + 1)
+        ],
+        "export_advanced_files": True,
+    }
+
+    validation = validate_sidecar_data(sidecar)
+
+    assert validation.status == "valid"
+
+
+def test_sidecar_schema_validation_rejects_more_than_ten_manual_analysis_bands() -> None:
+    sidecar = _valid_sidecar()
+    sidecar["intent"]["analysis"] = {
+        "enabled": True,
+        "roi": None,
+        "minimum_cell_support_fraction": 0.35,
+        "roi_quality_cutoff": 0.45,
+        "low_confidence_threshold": 0.35,
+        "auto_band_count": MAX_ANALYSIS_BANDS,
+        "band_mode": "manual_multi",
+        "manual_bands": [
+            {
+                "band_id": f"band{index:02d}",
+                "low_hz": 5.0 + index,
+                "high_hz": 5.5 + index,
+            }
+            for index in range(1, MAX_ANALYSIS_BANDS + 2)
+        ],
+        "export_advanced_files": True,
+    }
+
+    validation = validate_sidecar_data(sidecar)
+
+    assert validation.status == "invalid"
+    assert any("manual_bands" in error for error in validation.errors)
 
 
 def test_sidecar_schema_validation_rejects_malformed_output_details() -> None:
@@ -363,7 +416,7 @@ def test_sidecar_schema_validation_accepts_older_version_without_zone_mode() -> 
 
 def test_sidecar_schema_validation_rejects_newer_minor_version() -> None:
     sidecar = _valid_sidecar()
-    sidecar["schema_version"] = "1.5.0"
+    sidecar["schema_version"] = "1.6.0"
 
     validation = validate_sidecar_data(sidecar)
 

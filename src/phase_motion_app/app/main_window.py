@@ -70,8 +70,10 @@ from phase_motion_app.core.models import (
     AnalysisBand,
     AnalysisBandMode,
     AnalysisSettings,
+    DEFAULT_ANALYSIS_AUTO_BAND_COUNT,
     DiagnosticLevel,
     JobIntent,
+    MAX_ANALYSIS_BANDS,
     PhaseSettings,
     Resolution,
     ResourcePolicy,
@@ -419,7 +421,7 @@ class AnalysisAdvancedDialog(QDialog):
         super().__init__(parent)
         self._band_mode = band_mode
         self.setWindowTitle("Advanced Analysis")
-        self.resize(560, 420)
+        self.resize(620, 720)
 
         layout = QVBoxLayout(self)
         summary_label = QLabel(
@@ -447,7 +449,7 @@ class AnalysisAdvancedDialog(QDialog):
         self.analysis_low_confidence_spin.setSingleStep(0.05)
         self.analysis_low_confidence_spin.setValue(low_confidence_threshold)
         self.analysis_auto_band_count_spin = QSpinBox()
-        self.analysis_auto_band_count_spin.setRange(1, 5)
+        self.analysis_auto_band_count_spin.setRange(1, MAX_ANALYSIS_BANDS)
         self.analysis_auto_band_count_spin.setValue(auto_band_count)
         self.analysis_export_advanced_checkbox = QCheckBox(
             "Export advanced/internal analysis files"
@@ -460,9 +462,10 @@ class AnalysisAdvancedDialog(QDialog):
         manual_band_layout.setContentsMargins(0, 0, 0, 0)
         manual_band_layout.setSpacing(4)
         band_defaults = manual_band_values or tuple(
-            (index == 0, 5.0 + index, 12.0 + index) for index in range(5)
+            (index == 0, 5.0 + index, 12.0 + index)
+            for index in range(MAX_ANALYSIS_BANDS)
         )
-        for band_index in range(5):
+        for band_index in range(MAX_ANALYSIS_BANDS):
             enabled, low_hz, high_hz = band_defaults[band_index]
             row = QWidget()
             row_layout = QHBoxLayout(row)
@@ -807,8 +810,8 @@ class MainWindow(QMainWindow):
         self.analysis_low_confidence_spin.setSingleStep(0.05)
         self.analysis_low_confidence_spin.setValue(0.35)
         self.analysis_auto_band_count_spin = QSpinBox()
-        self.analysis_auto_band_count_spin.setRange(1, 5)
-        self.analysis_auto_band_count_spin.setValue(5)
+        self.analysis_auto_band_count_spin.setRange(1, MAX_ANALYSIS_BANDS)
+        self.analysis_auto_band_count_spin.setValue(DEFAULT_ANALYSIS_AUTO_BAND_COUNT)
         self.analysis_export_advanced_checkbox = QCheckBox("Export advanced/internal analysis files")
         self.analysis_export_advanced_checkbox.setChecked(True)
         self._manual_band_controls: list[tuple[QCheckBox, QDoubleSpinBox, QDoubleSpinBox]] = []
@@ -819,7 +822,7 @@ class MainWindow(QMainWindow):
         manual_band_layout = QVBoxLayout(self._analysis_manual_band_container)
         manual_band_layout.setContentsMargins(0, 0, 0, 0)
         manual_band_layout.setSpacing(4)
-        for band_index in range(5):
+        for band_index in range(MAX_ANALYSIS_BANDS):
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
@@ -1473,7 +1476,7 @@ class MainWindow(QMainWindow):
             return False
         if not (0.0 < intent.analysis.minimum_cell_support_fraction <= 1.0):
             return False
-        if not (1 <= intent.analysis.auto_band_count <= 5):
+        if not (1 <= intent.analysis.auto_band_count <= MAX_ANALYSIS_BANDS):
             return False
         if intent.analysis.band_mode is AnalysisBandMode.AUTO:
             return True
@@ -1486,7 +1489,7 @@ class MainWindow(QMainWindow):
             return False
         if (
             intent.analysis.band_mode is AnalysisBandMode.MANUAL_MULTI
-            and len(intent.analysis.manual_bands) > 5
+            and len(intent.analysis.manual_bands) > MAX_ANALYSIS_BANDS
         ):
             return False
         for band in intent.analysis.manual_bands:
