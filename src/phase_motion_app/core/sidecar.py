@@ -12,12 +12,13 @@ from jsonschema import Draft202012Validator
 
 from phase_motion_app.core.models import JobIntent, SidecarDocument
 
-SCHEMA_VERSION = "1.3.0"
+SCHEMA_VERSION = "1.4.0"
 _SEMVER_PATTERN = re.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
 _SUPPORTED_OLDER_SCHEMA_VERSIONS = {
     "1.0.0": "schema_version 1.0.0 was accepted through the explicit compatibility path.",
     "1.1.0": "schema_version 1.1.0 was accepted through the explicit compatibility path.",
     "1.2.0": "schema_version 1.2.0 was accepted through the explicit compatibility path.",
+    "1.3.0": "schema_version 1.3.0 was accepted through the explicit compatibility path.",
 }
 
 # The design doc defines the domains and required safety checks, but it does not
@@ -134,6 +135,7 @@ SIDECAR_SCHEMA_V1: dict[str, Any] = {
                 },
                 "output_container": {"type": "string", "const": "mp4"},
                 "requested_output_codec": {"type": "string", "minLength": 1},
+                "hardware_acceleration_enabled": {"type": "boolean"},
             },
         },
         "observed_environment": {
@@ -163,6 +165,9 @@ SIDECAR_SCHEMA_V1: dict[str, Any] = {
                     "type": "object",
                     "additionalProperties": {"type": "integer", "minimum": 1},
                 },
+                "acceleration_backend": {"type": ["string", "null"]},
+                "acceleration_device_name": {"type": ["string", "null"]},
+                "hardware_acceleration_active": {"type": "boolean"},
             },
         },
         "results": {
@@ -225,6 +230,10 @@ SIDECAR_SCHEMA_V1: dict[str, Any] = {
                             "type": "array",
                             "items": {"type": "string"},
                         },
+                        "hardware_acceleration_requested": {"type": "boolean"},
+                        "hardware_acceleration_active": {"type": "boolean"},
+                        "acceleration_backend": {"type": ["string", "null"]},
+                        "acceleration_status": {"type": ["string", "null"]},
                     },
                     "additionalProperties": False,
                 },
@@ -531,12 +540,9 @@ def _semantic_validation_errors(data: dict[str, Any]) -> list[str]:
                 "intent.analysis.manual_bands: manual_multi mode requires at least one manual band."
             )
 
-    if (
-        output_resolution["width"] > processing_resolution["width"]
-        or output_resolution["height"] > processing_resolution["height"]
-    ):
+    if output_resolution != processing_resolution:
         errors.append(
-            "intent.output_resolution: output resolution must not exceed processing resolution."
+            "intent.output_resolution: output resolution must match processing resolution."
         )
 
     drift_acknowledgement = data["results"].get("drift_acknowledgement")

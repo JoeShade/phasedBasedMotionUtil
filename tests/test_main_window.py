@@ -12,10 +12,11 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QGroupBox
 
 import phase_motion_app.app.main_window as main_window_module
 from phase_motion_app.app.main_window import MainWindow, PreflightWarningDialog
+from phase_motion_app.core.acceleration import AccelerationCapability, AccelerationDecision
 from phase_motion_app.core.baseline_band import FrequencyBandSuggestion
 from phase_motion_app.core.ffprobe import FfprobeMediaInfo
 from phase_motion_app.core.job_state import SourceSnapshot, UiState
@@ -142,7 +143,7 @@ def test_main_window_preserves_fractional_phase_settings_on_intent_reload(
             attenuate_other_frequencies=True,
         ),
         processing_resolution=Resolution(width=1280, height=720),
-        output_resolution=Resolution(width=640, height=360),
+        output_resolution=Resolution(width=1280, height=720),
         resource_policy=ResourcePolicy.BALANCED,
     )
 
@@ -158,6 +159,7 @@ def test_main_window_preserves_fractional_phase_settings_on_intent_reload(
     assert reloaded_intent.phase.magnification == 20.5
     assert reloaded_intent.phase.low_hz == 5.125
     assert reloaded_intent.phase.high_hz == 12.75
+    assert reloaded_intent.output_resolution == reloaded_intent.processing_resolution
 
 
 def test_main_window_roundtrips_analysis_settings_in_intent_reload(
@@ -175,7 +177,7 @@ def test_main_window_roundtrips_analysis_settings_in_intent_reload(
             attenuate_other_frequencies=True,
         ),
         processing_resolution=Resolution(width=1280, height=720),
-        output_resolution=Resolution(width=640, height=360),
+        output_resolution=Resolution(width=1280, height=720),
         resource_policy=ResourcePolicy.BALANCED,
         analysis=AnalysisSettings(
             enabled=True,
@@ -202,6 +204,104 @@ def test_main_window_roundtrips_analysis_settings_in_intent_reload(
     assert reloaded_intent.analysis.manual_bands[0].low_hz == 6.0
     assert reloaded_intent.analysis.auto_band_count == 4
     assert reloaded_intent.analysis.export_advanced_files is False
+    assert reloaded_intent.output_resolution == reloaded_intent.processing_resolution
+
+
+def test_main_window_hardware_acceleration_checkbox_round_trips_through_intent(
+    tmp_path: Path,
+) -> None:
+    app = _app()
+    window = MainWindow(state_path=tmp_path / "settings.json")
+    intent = JobIntent(
+        phase=PhaseSettings(
+            magnification=20.0,
+            low_hz=5.0,
+            high_hz=12.0,
+            pyramid_type="complex_steerable",
+            sigma=1.0,
+            attenuate_other_frequencies=True,
+        ),
+        processing_resolution=Resolution(width=1280, height=720),
+        output_resolution=Resolution(width=1280, height=720),
+        resource_policy=ResourcePolicy.BALANCED,
+        hardware_acceleration_enabled=True,
+    )
+
+    try:
+        window._apply_intent(intent)
+        reloaded_intent = window._build_intent()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert window.hardware_acceleration_checkbox.isChecked() is True
+    assert reloaded_intent.hardware_acceleration_enabled is True
+
+
+def test_main_window_hardware_acceleration_status_text_reports_availability_and_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = _app()
+    states = {
+        True: AccelerationDecision(
+            requested=True,
+            active=False,
+            status="gpu_requested_cpu_fallback",
+            detail=(
+                "Hardware acceleration was requested, but the optional CuPy backend "
+                "is not installed. CPU fallback will be used."
+            ),
+            backend_name="cupy",
+        ),
+        False: AccelerationDecision(
+            requested=False,
+            active=False,
+            status="cpu_selected",
+            detail=(
+                "Hardware acceleration is available but disabled. The authoritative "
+                "CPU path will be used."
+            ),
+            backend_name="cupy",
+            device_name="Example GPU",
+        ),
+    }
+    monkeypatch.setattr(
+        main_window_module,
+        "detect_acceleration_capability",
+        lambda: AccelerationCapability(
+            backend_name="cupy",
+            importable=True,
+            usable=True,
+            status="available",
+            detail="CuPy and a compatible CUDA device are available.",
+            installed_version="13.0",
+            device_name="Example GPU",
+        ),
+    )
+    monkeypatch.setattr(
+        main_window_module,
+        "resolve_acceleration_request",
+        lambda requested, capability=None: states[requested],
+    )
+    window = MainWindow(state_path=tmp_path / "settings.json")
+
+    try:
+        disabled_text = window.hardware_acceleration_status_label.text()
+        window.hardware_acceleration_checkbox.setChecked(True)
+        fallback_text = window.hardware_acceleration_status_label.text()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert "Available: CuPy on Example GPU" in disabled_text
+    assert "Enable the checkbox" in disabled_text
+    assert "Unavailable: CuPy on Example GPU" in fallback_text
+    assert "CPU fallback" in fallback_text
 
 
 def test_main_window_analysis_validation_blocks_invalid_manual_band(
@@ -577,7 +677,7 @@ def test_main_window_output_resolution_options_stay_even_for_codec_path(
         window._on_source_probe_complete(probe)
         processing_index = window._find_resolution_index(
             window.processing_resolution_combo,
-            Resolution(853, 480),
+            Resolution(852, 480),
         )
         window.processing_resolution_combo.setCurrentIndex(processing_index)
         processing_options = [
@@ -588,14 +688,60 @@ def test_main_window_output_resolution_options_stay_even_for_codec_path(
             window.output_resolution_combo.itemText(index)
             for index in range(window.output_resolution_combo.count())
         ]
+        mirrored_output = window.output_resolution_combo.currentData()
+        output_combo_enabled = window.output_resolution_combo.isEnabled()
     finally:
         window.close()
         window.deleteLater()
         app.processEvents()
         app.quit()
 
-    assert processing_options == ["853 x 480", "640 x 360"]
-    assert output_options == ["852 x 480", "640 x 360"]
+    assert processing_options == ["852 x 480", "640 x 360"]
+    assert output_options == ["852 x 480"]
+    assert mirrored_output == Resolution(852, 480)
+    assert output_combo_enabled is False
+
+
+def test_main_window_output_resolution_mirrors_processing_selection(
+    tmp_path: Path,
+) -> None:
+    app = _app()
+    window = MainWindow(state_path=tmp_path / "settings.json")
+    probe = FfprobeMediaInfo(
+        width=1280,
+        height=720,
+        fps=30.0,
+        avg_fps=30.0,
+        is_cfr=True,
+        duration_seconds=2.0,
+        frame_count=60,
+        bit_depth=8,
+        audio_stream_count=0,
+        codec_name="h264",
+        profile="High",
+        pixel_format="yuv420p",
+        color_primaries="bt709",
+        color_transfer="bt709",
+        color_space="bt709",
+        color_range="tv",
+    )
+    window._start_baseline_band_analysis = lambda _info: None
+
+    try:
+        window._on_source_probe_complete(probe)
+        processing_index = window._find_resolution_index(
+            window.processing_resolution_combo,
+            Resolution(640, 360),
+        )
+        window.processing_resolution_combo.setCurrentIndex(processing_index)
+        mirrored_output = window.output_resolution_combo.currentData()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert mirrored_output == Resolution(640, 360)
 
 
 def test_main_window_restarts_probe_and_fingerprint_when_source_goes_stale(
@@ -771,7 +917,7 @@ def test_main_window_ignores_persisted_output_folder_for_startup_default(
                     attenuate_other_frequencies=True,
                 ),
                 processing_resolution=Resolution(1280, 720),
-                output_resolution=Resolution(640, 360),
+                output_resolution=Resolution(1280, 720),
                 resource_policy=ResourcePolicy.BALANCED,
             ),
             output_directory=str(persisted_output),
@@ -1109,19 +1255,25 @@ def test_main_window_exposes_watermark_style_anchors(tmp_path: Path) -> None:
     assert window.content_scroll_area.viewport().objectName() == "contentViewport"
 
 
-def test_main_window_uses_short_upscale_note(tmp_path: Path) -> None:
+def test_main_window_keeps_hardware_controls_in_core_settings(tmp_path: Path) -> None:
     app = _app()
     window = MainWindow(state_path=tmp_path / "settings.json")
 
     try:
-        note_text = window.upscale_note.text()
+        group_titles = {group.title() for group in window.findChildren(QGroupBox)}
+        tooltip_text = window.output_resolution_combo.toolTip()
     finally:
         window.close()
         window.deleteLater()
         app.processEvents()
         app.quit()
 
-    assert note_text == "Upscaling is disabled."
+    assert "Performance" not in group_titles
+    assert not hasattr(window, "upscale_note")
+    assert (
+        tooltip_text
+        == "Output resolution mirrors processing resolution for the current pipeline."
+    )
 
 
 def test_main_window_formats_preflight_report_with_grouped_megabytes(tmp_path: Path) -> None:

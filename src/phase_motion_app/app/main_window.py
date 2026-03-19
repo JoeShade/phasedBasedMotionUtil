@@ -44,6 +44,10 @@ from PyQt6.QtWidgets import (
 
 from phase_motion_app.app.drift_editor import AnalysisRoiEditorDialog, DriftEditorDialog
 from phase_motion_app.app.terminal_outcome import TerminalOutcomeData, TerminalOutcomeDialog
+from phase_motion_app.core.acceleration import (
+    detect_acceleration_capability,
+    resolve_acceleration_request,
+)
 from phase_motion_app.core.baseline_band import (
     FrequencyBandSuggestion,
     analyze_source_frequency_band,
@@ -175,7 +179,7 @@ def _codec_safe_output_resolution(
     *,
     processing_resolution: Resolution,
 ) -> Resolution | None:
-    """Clamp output geometry to the current 4:2:0 encoder requirements without ever upscaling."""
+    """Clamp one processing/output geometry to the current 4:2:0 encoder requirements without ever upscaling."""
 
     width = min(resolution.width, processing_resolution.width)
     height = min(resolution.height, processing_resolution.height)
@@ -607,6 +611,7 @@ class MainWindow(QMainWindow):
         self._load_persisted_state()
         self._wire_signals()
         self._update_analysis_controls()
+        self._update_performance_status()
         self._refresh_state()
 
         self._stale_timer = QTimer(self)
@@ -712,11 +717,22 @@ class MainWindow(QMainWindow):
         self.resource_policy_combo = QComboBox()
         for policy in ResourcePolicy:
             self.resource_policy_combo.addItem(policy.value.title(), policy)
+        self.hardware_acceleration_checkbox = QCheckBox(
+            "Enable hardware acceleration"
+        )
+        self.hardware_acceleration_status_label = QLabel("")
+        self.hardware_acceleration_status_label.setWordWrap(True)
         self.processing_resolution_combo = QComboBox()
         self.output_resolution_combo = QComboBox()
+        self.output_resolution_combo.setEnabled(False)
+        self.output_resolution_combo.setToolTip(
+            "Output resolution mirrors processing resolution for the current pipeline."
+        )
         self._rebuild_processing_resolution_options()
-        self.upscale_note = QLabel("Upscaling is disabled.")
-        self.upscale_note.setWordWrap(True)
+        self.performance_summary_label = QLabel(
+            "Tied render resolution avoids a second resize pass. Hardware acceleration targets dense warp, resize, and FFT-based motion estimation. Pre-flight reports CPU fallback when acceleration cannot run."
+        )
+        self.performance_summary_label.setWordWrap(True)
         self.exclusion_editor_button = QPushButton("Drift Check / Mask Zones")
         self.exclusion_editor_button.setEnabled(False)
         settings_layout.addRow("Magnification", self.magnification_spin)
@@ -725,9 +741,11 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Suggested band", self.suggested_band_label)
         settings_layout.addRow("", self.apply_suggested_band_button)
         settings_layout.addRow("Resource policy", self.resource_policy_combo)
+        settings_layout.addRow("", self.hardware_acceleration_checkbox)
+        settings_layout.addRow("Acceleration support", self.hardware_acceleration_status_label)
         settings_layout.addRow("Processing resolution", self.processing_resolution_combo)
         settings_layout.addRow("Output resolution", self.output_resolution_combo)
-        settings_layout.addRow("", self.upscale_note)
+        settings_layout.addRow("Performance notes", self.performance_summary_label)
         settings_layout.addRow("Mask editor", self.exclusion_editor_button)
 
         analysis_group = QGroupBox("Analysis")
@@ -946,12 +964,15 @@ class MainWindow(QMainWindow):
             self._rebuild_output_resolution_options
         )
         self.processing_resolution_combo.currentIndexChanged.connect(self._update_settings_state)
-        self.output_resolution_combo.currentIndexChanged.connect(self._update_settings_state)
         self.magnification_spin.valueChanged.connect(self._update_settings_state)
         self.low_hz_spin.valueChanged.connect(self._mark_band_edited)
         self.high_hz_spin.valueChanged.connect(self._mark_band_edited)
         self.low_hz_spin.valueChanged.connect(self._update_settings_state)
         self.high_hz_spin.valueChanged.connect(self._update_settings_state)
+        self.hardware_acceleration_checkbox.toggled.connect(self._update_settings_state)
+        self.hardware_acceleration_checkbox.toggled.connect(
+            self._update_performance_status
+        )
         self.analysis_enabled_checkbox.toggled.connect(self._update_settings_state)
         self.analysis_enabled_checkbox.toggled.connect(self._update_analysis_controls)
         self.analysis_band_mode_combo.currentIndexChanged.connect(self._update_settings_state)
@@ -1301,35 +1322,16 @@ class MainWindow(QMainWindow):
 
     def _rebuild_output_resolution_options(self) -> None:
         processing = self.processing_resolution_combo.currentData()
-        previous_output = self.output_resolution_combo.currentData()
         self.output_resolution_combo.blockSignals(True)
         self.output_resolution_combo.clear()
         if processing is not None:
-            seen: set[tuple[int, int]] = set()
-            for resolution in self._resolution_options:
-                if (
-                    resolution.width <= processing.width
-                    and resolution.height <= processing.height
-                ):
-                    output_resolution = _codec_safe_output_resolution(
-                        resolution,
-                        processing_resolution=processing,
-                    )
-                    if output_resolution is None:
-                        continue
-                    key = (output_resolution.width, output_resolution.height)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    label = f"{output_resolution.width} x {output_resolution.height}"
-                    self.output_resolution_combo.addItem(label, output_resolution)
-        if previous_output is not None:
-            previous_index = self._find_resolution_index(
-                self.output_resolution_combo, previous_output
+            mirrored_resolution = _codec_safe_output_resolution(
+                processing,
+                processing_resolution=processing,
             )
-            if previous_index >= 0:
-                self.output_resolution_combo.setCurrentIndex(previous_index)
-            elif self.output_resolution_combo.count() > 0:
+            if mirrored_resolution is not None:
+                label = f"{mirrored_resolution.width} x {mirrored_resolution.height}"
+                self.output_resolution_combo.addItem(label, mirrored_resolution)
                 self.output_resolution_combo.setCurrentIndex(0)
         self.output_resolution_combo.blockSignals(False)
 
@@ -1345,9 +1347,20 @@ class MainWindow(QMainWindow):
         )
         self.processing_resolution_combo.blockSignals(True)
         self.processing_resolution_combo.clear()
+        seen: set[tuple[int, int]] = set()
         for resolution in self._resolution_options:
-            label = f"{resolution.width} x {resolution.height}"
-            self.processing_resolution_combo.addItem(label, resolution)
+            safe_resolution = _codec_safe_output_resolution(
+                resolution,
+                processing_resolution=resolution,
+            )
+            if safe_resolution is None:
+                continue
+            key = (safe_resolution.width, safe_resolution.height)
+            if key in seen:
+                continue
+            seen.add(key)
+            label = f"{safe_resolution.width} x {safe_resolution.height}"
+            self.processing_resolution_combo.addItem(label, safe_resolution)
         if previous_processing is not None:
             previous_index = self._find_resolution_index(
                 self.processing_resolution_combo,
@@ -1419,6 +1432,7 @@ class MainWindow(QMainWindow):
         )
 
     def _build_intent(self) -> JobIntent:
+        processing_resolution = self.processing_resolution_combo.currentData()
         return JobIntent(
             phase=PhaseSettings(
                 magnification=float(self.magnification_spin.value()),
@@ -1428,12 +1442,13 @@ class MainWindow(QMainWindow):
                 sigma=1.0,
                 attenuate_other_frequencies=True,
             ),
-            processing_resolution=self.processing_resolution_combo.currentData(),
-            output_resolution=self.output_resolution_combo.currentData(),
+            processing_resolution=processing_resolution,
+            output_resolution=processing_resolution,
             resource_policy=self.resource_policy_combo.currentData(),
             exclusion_zones=self._exclusion_zones,
             mask_feather_px=self._mask_feather_px,
             analysis=self._build_analysis_settings(),
+            hardware_acceleration_enabled=self.hardware_acceleration_checkbox.isChecked(),
         )
 
     def _find_resolution_index(
@@ -1553,6 +1568,30 @@ class MainWindow(QMainWindow):
             f"{export_text}."
         )
 
+    def _update_performance_status(self) -> None:
+        capability = detect_acceleration_capability()
+        decision = resolve_acceleration_request(
+            self.hardware_acceleration_checkbox.isChecked(),
+            capability=capability,
+        )
+        backend_name = capability.backend_name or decision.backend_name or "cupy"
+        backend_label = "CuPy" if backend_name.lower() == "cupy" else backend_name
+        device_name = decision.device_name or capability.device_name
+        backend_text = (
+            f"{backend_label} on {device_name}" if device_name else backend_label
+        )
+        if decision.active:
+            status_text = f"Active: {backend_text}. {decision.detail}"
+        elif decision.requested:
+            status_text = f"Unavailable: {backend_text}. {decision.detail}"
+        elif capability.usable:
+            status_text = (
+                f"Available: {backend_text}. Enable the checkbox to use hardware acceleration."
+            )
+        else:
+            status_text = f"Unavailable: {backend_text}. {capability.detail}"
+        self.hardware_acceleration_status_label.setText(status_text)
+
     def _update_settings_state(self) -> None:
         processing_resolution = self.processing_resolution_combo.currentData()
         output_resolution = self.output_resolution_combo.currentData()
@@ -1572,11 +1611,11 @@ class MainWindow(QMainWindow):
             and intent.mask_feather_px > 0
             and intent.phase.high_hz > intent.phase.low_hz
             and self._analysis_settings_valid(intent)
-            and intent.output_resolution.width <= intent.processing_resolution.width
-            and intent.output_resolution.height <= intent.processing_resolution.height
+            and intent.output_resolution == intent.processing_resolution
         )
         self._controller.set_settings_complete(settings_complete)
         self._update_analysis_controls()
+        self._update_performance_status()
         self._refresh_state()
 
     def _zones_valid_for_current_source(self) -> bool:
@@ -1753,14 +1792,12 @@ class MainWindow(QMainWindow):
         if processing_index >= 0:
             self.processing_resolution_combo.setCurrentIndex(processing_index)
         self._rebuild_output_resolution_options()
-        output_index = self._find_resolution_index(
-            self.output_resolution_combo, intent.output_resolution
-        )
-        if output_index >= 0:
-            self.output_resolution_combo.setCurrentIndex(output_index)
         self._exclusion_zones = intent.exclusion_zones
         self._mask_feather_px = intent.mask_feather_px
         self._analysis_roi = intent.analysis.roi
+        self.hardware_acceleration_checkbox.setChecked(
+            intent.hardware_acceleration_enabled
+        )
         self.analysis_enabled_checkbox.setChecked(intent.analysis.enabled)
         self.analysis_band_mode_combo.setCurrentIndex(
             self.analysis_band_mode_combo.findData(intent.analysis.band_mode)
@@ -1962,6 +1999,10 @@ class MainWindow(QMainWindow):
             "active_scratch_required_bytes": report.active_scratch_required_bytes,
             "ram_required_bytes": report.ram_required_bytes,
             "output_staging_required_bytes": report.output_staging_required_bytes,
+            "hardware_acceleration_requested": report.hardware_acceleration_requested,
+            "hardware_acceleration_active": report.hardware_acceleration_active,
+            "acceleration_backend": report.acceleration_backend,
+            "acceleration_status": report.acceleration_status,
         }
 
     def _start_render(self) -> None:
@@ -2503,6 +2544,30 @@ class MainWindow(QMainWindow):
                 f"{self._format_measurement(details.get('selected_high_hz'), unit=' Hz')}"
             ),
             f"Resource policy: {details.get('resource_policy', '-')}",
+            (
+                "Hardware acceleration requested: "
+                + (
+                    "yes"
+                    if details.get("hardware_acceleration_requested") is True
+                    else "no"
+                )
+            ),
+            (
+                "Hardware acceleration active: "
+                + (
+                    "yes"
+                    if details.get("hardware_acceleration_active") is True
+                    else "no"
+                )
+            ),
+            (
+                "Acceleration backend: "
+                f"{details.get('acceleration_backend') or 'cpu'}"
+            ),
+            (
+                "Acceleration status: "
+                f"{details.get('acceleration_status') or '-'}"
+            ),
             f"Active scratch required: {self._format_megabytes(details.get('active_scratch_required_bytes'))}",
             f"RAM required: {self._format_megabytes(details.get('ram_required_bytes'))}",
             f"Output staging required: {self._format_megabytes(details.get('output_staging_required_bytes'))}",

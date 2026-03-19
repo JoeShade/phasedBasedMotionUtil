@@ -10,8 +10,13 @@ import time
 import zlib
 
 import numpy as np
+import pytest
 import phase_motion_app.core.quantitative_analysis as quantitative_analysis_module
 
+from phase_motion_app.core.acceleration import (
+    build_processing_backend,
+    detect_acceleration_capability,
+)
 from phase_motion_app.core.drift import DriftAssessment
 from phase_motion_app.core.models import AnalysisBand, AnalysisBandMode, AnalysisSettings, Resolution
 from phase_motion_app.core.models import ExclusionZone, ZoneMode, ZoneShape
@@ -288,6 +293,84 @@ def test_background_quantitative_analysis_surfaces_worker_failure(tmp_path: Path
         raise AssertionError("background failure did not surface in time")
     finally:
         background.close()
+
+
+def test_background_quantitative_analysis_queues_host_copies_for_device_like_chunks(
+    tmp_path: Path,
+) -> None:
+    class _RecordingAnalyzer:
+        def __init__(self) -> None:
+            self.received: list[np.ndarray] = []
+
+        def add_chunk(self, frames_rgb: np.ndarray) -> None:
+            self.received.append(frames_rgb)
+
+        def finalize(self, _output_directory: Path):
+            return {"status": "completed"}
+
+    class _FakeGpuChunk:
+        def __init__(self, frames_rgb: np.ndarray) -> None:
+            self._frames_rgb = frames_rgb
+            self.shape = frames_rgb.shape
+
+        def __getitem__(self, item):
+            return _FakeGpuChunk(self._frames_rgb[item])
+
+        def get(self) -> np.ndarray:
+            return self._frames_rgb.copy()
+
+    analyzer = _RecordingAnalyzer()
+    background = BackgroundStreamingQuantitativeAnalyzer(
+        analyzer,
+        queue_depth=1,
+    )
+    gpu_like_chunk = _FakeGpuChunk(np.ones((10, 4, 4, 3), dtype=np.float32))
+
+    try:
+        background.add_chunk(gpu_like_chunk)
+        background.finalize(tmp_path)
+    finally:
+        background.close()
+
+    assert len(analyzer.received) == 5
+    assert all(
+        queued_chunk.shape[0] <= quantitative_analysis_module._ANALYSIS_QUEUE_BATCH_FRAMES
+        for queued_chunk in analyzer.received
+    )
+    for queued_chunk in analyzer.received:
+        assert isinstance(queued_chunk, np.ndarray)
+        assert queued_chunk.dtype == np.float32
+        assert np.allclose(queued_chunk, 1.0)
+
+
+def test_quantitative_analysis_reuses_accelerated_motion_backend_when_available(
+    tmp_path: Path,
+) -> None:
+    capability = detect_acceleration_capability()
+    if not capability.usable:
+        pytest.skip("Optional CuPy backend is unavailable in this test environment.")
+
+    _, backend = build_processing_backend(True)
+    frames = _synthetic_motion_frames()
+    reference_luma = frames.mean(axis=0, dtype=np.float32)[..., 1]
+    analyzer = StreamingQuantitativeAnalyzer(
+        settings=AnalysisSettings(export_advanced_files=False),
+        processing_resolution=Resolution(32, 32),
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=4.0,
+        reference_luma=reference_luma,
+        exclusion_zones=(),
+        drift_assessment=DriftAssessment(),
+        backend=backend,
+    )
+
+    analyzer.add_chunk(backend.asarray(frames[:8], dtype=backend.xp.float32, copy=False))
+    analyzer.add_chunk(backend.asarray(frames[8:], dtype=backend.xp.float32, copy=False))
+    export = analyzer.finalize(tmp_path)
+
+    assert export.summary["status"] == "completed"
+    assert (tmp_path / "analysis_metadata.json").exists()
 
 
 def test_disabled_or_empty_quantitative_analysis_does_not_claim_band_activity_plot(

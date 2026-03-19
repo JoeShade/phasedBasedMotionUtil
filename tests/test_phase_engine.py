@@ -5,8 +5,13 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 
 import phase_motion_app.core.phase_engine as phase_engine_module
+from phase_motion_app.core.acceleration import (
+    build_processing_backend,
+    detect_acceleration_capability,
+)
 from phase_motion_app.core.phase_engine import StreamingPhaseAmplifier, amplify_motion_rgb
 
 
@@ -336,6 +341,44 @@ def test_analysis_confidence_normalization_preserves_mid_confidence_cells_more_t
     assert float(analysis_normalized[0, 1]) > float(render_normalized[0, 1])
     assert float(analysis_normalized[0, 2]) > float(render_normalized[0, 2])
     assert float(analysis_normalized[1, 2]) == 1.0
+
+
+def test_streaming_phase_amplifier_matches_accelerated_backend_when_available() -> None:
+    capability = detect_acceleration_capability()
+    if not capability.usable:
+        pytest.skip("Optional CuPy backend is unavailable in this test environment.")
+
+    _, backend = build_processing_backend(True)
+    clip = _make_blob_motion_clip()[:8]
+    reference_luma = (
+        0.2126 * clip[..., 0] + 0.7152 * clip[..., 1] + 0.0722 * clip[..., 2]
+    ).mean(axis=0).astype(np.float32)
+    cpu_amplifier = StreamingPhaseAmplifier(
+        reference_luma=reference_luma,
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=3.0,
+        magnification=4.0,
+    )
+    accelerated_amplifier = StreamingPhaseAmplifier(
+        reference_luma=reference_luma,
+        fps=12.0,
+        low_hz=1.0,
+        high_hz=3.0,
+        magnification=4.0,
+        backend=backend,
+    )
+
+    try:
+        cpu_output = cpu_amplifier.process_chunk(clip)
+        accelerated_output = accelerated_amplifier.process_chunk(
+            backend.asarray(clip, dtype=backend.xp.float32, copy=False)
+        )
+    finally:
+        cpu_amplifier.close()
+        accelerated_amplifier.close()
+
+    assert np.allclose(backend.to_host(accelerated_output), cpu_output, atol=1e-4)
 
 # ######################################################################################################################
 #

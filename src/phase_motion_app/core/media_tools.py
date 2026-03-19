@@ -213,20 +213,35 @@ class RawvideoDecodeProcess:
             for frame_index in range(frame_count)
         ]
 
-    def read_chunk_bytes(self, max_frames: int) -> bytearray:
+    def read_chunk_bytes(
+        self,
+        max_frames: int,
+        *,
+        into_buffer: memoryview | bytearray | None = None,
+    ) -> bytearray | memoryview:
         """Read one bounded chunk as one packed byte buffer so callers can avoid per-frame Python joins."""
 
         if max_frames <= 0:
             return bytearray()
         assert self.process.stdout is not None
         target_bytes = self.frame_size_bytes * max_frames
-        buffer = bytearray(target_bytes)
-        view = memoryview(buffer)
+        if into_buffer is None:
+            buffer = bytearray(target_bytes)
+            view = memoryview(buffer)
+        else:
+            view = (
+                into_buffer
+                if isinstance(into_buffer, memoryview)
+                else memoryview(into_buffer)
+            )
+            if len(view) < target_bytes:
+                raise ValueError("Provided decode buffer is smaller than the requested chunk.")
+            buffer = None
         total_bytes = 0
         while total_bytes < target_bytes:
             reader = getattr(self.process.stdout, "readinto", None)
             if callable(reader):
-                read_count = reader(view[total_bytes:])
+                read_count = reader(view[total_bytes:target_bytes])
             else:
                 chunk = self.process.stdout.read(target_bytes - total_bytes)
                 read_count = len(chunk)
@@ -238,9 +253,12 @@ class RawvideoDecodeProcess:
         complete_bytes = (total_bytes // self.frame_size_bytes) * self.frame_size_bytes
         # Drop the exported view before returning a shortened tail chunk. Python
         # forbids resizing a bytearray while a memoryview still references it.
-        view.release()
+        if buffer is not None:
+            view.release()
         if complete_bytes <= 0:
             return bytearray()
+        if buffer is None:
+            return view[:complete_bytes]
         if complete_bytes == target_bytes:
             return buffer
         return bytearray(buffer[:complete_bytes])
@@ -360,7 +378,16 @@ class RawvideoEncodeProcess:
         """Write one packed RGB byte run so callers can batch multiple frames per Python call."""
 
         assert self.process.stdin is not None
-        self.process.stdin.write(frames_rgb24)
+        view = memoryview(frames_rgb24).cast("B")
+        total_bytes = len(view)
+        bytes_written = 0
+        while bytes_written < total_bytes:
+            wrote = self.process.stdin.write(view[bytes_written:])
+            if wrote is None:
+                wrote = total_bytes - bytes_written
+            if wrote <= 0:
+                raise BrokenPipeError("Encoder stdin stopped accepting frame data.")
+            bytes_written += wrote
 
     def take_progress_counter(self) -> int | None:
         """Return the latest child-reported encoded-frame counter when ffmpeg has emitted one."""

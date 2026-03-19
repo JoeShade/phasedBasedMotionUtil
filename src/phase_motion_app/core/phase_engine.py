@@ -9,6 +9,23 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from phase_motion_app.core.acceleration import (
+    AccelerationDecision,
+    CpuProcessingBackend,
+    CupyProcessingBackend,
+)
+
+ProcessingBackend = CpuProcessingBackend | CupyProcessingBackend
+
+_CPU_BACKEND = CpuProcessingBackend(
+    AccelerationDecision(
+        requested=False,
+        active=False,
+        status="cpu_selected",
+        detail="Hardware acceleration is disabled. The authoritative CPU path will be used.",
+    )
+)
+
 
 @dataclass(frozen=True)
 class _MotionGridLayout:
@@ -68,11 +85,21 @@ class _WarpGeometry:
 class _StreamingBandpassFilter:
     """This helper applies a simple stateful temporal band-pass so chunk windows can be processed sequentially."""
 
-    def __init__(self, *, grid_shape: tuple[int, int], fps: float, low_hz: float, high_hz: float) -> None:
+    def __init__(
+        self,
+        *,
+        grid_shape: tuple[int, int],
+        fps: float,
+        low_hz: float,
+        high_hz: float,
+        backend: ProcessingBackend | None = None,
+    ) -> None:
+        self._backend = _CPU_BACKEND if backend is None else backend
+        xp = self._backend.xp
         self._alpha_low = _lowpass_alpha(fps=fps, cutoff_hz=low_hz)
         self._alpha_high = _lowpass_alpha(fps=fps, cutoff_hz=high_hz)
-        self._low_state = np.zeros(grid_shape, dtype=np.float32)
-        self._high_state = np.zeros(grid_shape, dtype=np.float32)
+        self._low_state = xp.zeros(grid_shape, dtype=xp.float32)
+        self._high_state = xp.zeros(grid_shape, dtype=xp.float32)
 
     def filter_chunk(
         self,
@@ -81,7 +108,8 @@ class _StreamingBandpassFilter:
         progress_callback: Callable[[str], None] | None = None,
         progress_prefix: str = "temporal",
     ) -> np.ndarray:
-        filtered = np.empty_like(signal, dtype=np.float32)
+        xp = self._backend.xp
+        filtered = xp.empty_like(signal, dtype=xp.float32)
         frame_count = signal.shape[0]
         progress_step = max(1, frame_count // 8)
         for frame_index in range(frame_count):
@@ -118,15 +146,23 @@ class StreamingPhaseAmplifier:
         warp_worker_count: int = 1,
         motion_worker_count: int = 1,
         worker_pool: Executor | None = None,
+        backend: ProcessingBackend | None = None,
     ) -> None:
         if reference_luma.ndim != 2:
             raise ValueError("reference_luma must have shape [height, width].")
         if magnification <= 0:
             raise ValueError("magnification must be positive.")
 
+        self._backend = _CPU_BACKEND if backend is None else backend
+        reference_luma_array = self._backend.asarray(
+            reference_luma,
+            dtype=self._backend.xp.float32,
+            copy=False,
+        )
         self._reference = _build_motion_reference(
-            reference_luma.astype(np.float32, copy=False),
+            reference_luma_array.astype(self._backend.xp.float32, copy=False),
             sigma_scale=max(sigma, 0.1),
+            backend=self._backend,
         )
         grid_shape = (
             len(self._reference.layout.row_starts),
@@ -137,17 +173,23 @@ class StreamingPhaseAmplifier:
             fps=fps,
             low_hz=low_hz,
             high_hz=high_hz,
+            backend=self._backend,
         )
         self._y_filter = _StreamingBandpassFilter(
             grid_shape=grid_shape,
             fps=fps,
             low_hz=low_hz,
             high_hz=high_hz,
+            backend=self._backend,
         )
         self._magnification = np.float32(magnification)
         self._attenuate_other_frequencies = attenuate_other_frequencies
-        self._warp_worker_count = max(1, int(warp_worker_count))
-        self._motion_worker_count = max(1, int(motion_worker_count))
+        if self._backend.active:
+            self._warp_worker_count = 1
+            self._motion_worker_count = 1
+        else:
+            self._warp_worker_count = max(1, int(warp_worker_count))
+            self._motion_worker_count = max(1, int(motion_worker_count))
         self._owned_worker_pool: ThreadPoolExecutor | None = None
         self._worker_pool = worker_pool
         helper_count = max(self._warp_worker_count, self._motion_worker_count)
@@ -164,6 +206,7 @@ class StreamingPhaseAmplifier:
             width=self._reference.width,
             source_height=len(self._reference.layout.row_starts),
             source_width=len(self._reference.layout.column_starts),
+            backend=self._backend,
         )
 
     def close(self) -> None:
@@ -201,14 +244,19 @@ class StreamingPhaseAmplifier:
         ):
             raise ValueError("frames_rgb must match the reference geometry.")
 
-        working = frames_rgb.astype(np.float32, copy=False)
-        luma = _rgb_to_luma(working)
+        working = self._backend.asarray(
+            frames_rgb,
+            dtype=self._backend.xp.float32,
+            copy=False,
+        )
+        luma = _rgb_to_luma(working, backend=self._backend)
         displacement_x, displacement_y, confidence = _estimate_local_phase_shifts_against_reference(
             luma,
             self._reference,
             worker_pool=self._worker_pool,
             worker_count=self._motion_worker_count,
             progress_callback=progress_callback,
+            backend=self._backend,
         )
         if progress_callback is not None:
             progress_callback("motion_grid_done")
@@ -240,7 +288,7 @@ class StreamingPhaseAmplifier:
                 displacement_y - displacement_y.mean(axis=0, dtype=np.float32)
             )
 
-        confidence_scale = _normalize_confidence(confidence)
+        confidence_scale = _normalize_confidence(confidence, backend=self._backend)
         motion_gain = np.float32(self._magnification * 1.4)
         displacement_x_grid = phase_motion_x * confidence_scale[None, :, :] * motion_gain
         displacement_y_grid = phase_motion_y * confidence_scale[None, :, :] * motion_gain
@@ -258,10 +306,14 @@ class StreamingPhaseAmplifier:
             worker_count=self._warp_worker_count,
             progress_callback=progress_callback,
             progress_prefix="warp",
+            backend=self._backend,
         )
         if progress_callback is not None:
             progress_callback("warp_done")
-        return np.clip(amplified_rgb, 0.0, 1.0).astype(np.float32, copy=False)
+        return self._backend.xp.clip(amplified_rgb, 0.0, 1.0).astype(
+            self._backend.xp.float32,
+            copy=False,
+        )
 
 
 def amplify_motion_rgb(
@@ -276,6 +328,7 @@ def amplify_motion_rgb(
     warp_worker_count: int = 1,
     motion_worker_count: int = 1,
     progress_callback: Callable[[str], None] | None = None,
+    backend: ProcessingBackend | None = None,
 ) -> np.ndarray:
     """Amplify motion by phase-correlating local windows, filtering those motions over time, and warping the original RGB clip with the amplified displacement field."""
 
@@ -284,8 +337,13 @@ def amplify_motion_rgb(
     if frames_rgb.shape[0] < 2 or magnification <= 0:
         return frames_rgb.copy()
 
-    working = frames_rgb.astype(np.float32, copy=False)
-    luma = _rgb_to_luma(working)
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    working = selected_backend.asarray(
+        frames_rgb,
+        dtype=selected_backend.xp.float32,
+        copy=False,
+    )
+    luma = _rgb_to_luma(working, backend=selected_backend)
 
     layout = _build_motion_grid_layout(
         height=luma.shape[1],
@@ -293,7 +351,11 @@ def amplify_motion_rgb(
         sigma_scale=max(sigma, 0.1),
     )
     worker_pool: ThreadPoolExecutor | None = None
-    helper_count = max(int(warp_worker_count), int(motion_worker_count), 1)
+    helper_count = (
+        1
+        if selected_backend.active
+        else max(int(warp_worker_count), int(motion_worker_count), 1)
+    )
     if helper_count > 1:
         worker_pool = ThreadPoolExecutor(
             max_workers=helper_count,
@@ -306,6 +368,7 @@ def amplify_motion_rgb(
             worker_pool=worker_pool,
             worker_count=motion_worker_count,
             progress_callback=progress_callback,
+            backend=selected_backend,
         )
         if progress_callback is not None:
             progress_callback("motion_grid_done")
@@ -317,6 +380,7 @@ def amplify_motion_rgb(
             high_hz=high_hz,
             progress_callback=progress_callback,
             progress_prefix="x_temporal_band",
+            backend=selected_backend,
         )
         if progress_callback is not None:
             progress_callback("x_temporal_band_done")
@@ -328,6 +392,7 @@ def amplify_motion_rgb(
             high_hz=high_hz,
             progress_callback=progress_callback,
             progress_prefix="y_temporal_band",
+            backend=selected_backend,
         )
         if progress_callback is not None:
             progress_callback("y_temporal_band_done")
@@ -343,7 +408,7 @@ def amplify_motion_rgb(
                 displacement_y - displacement_y.mean(axis=0, dtype=np.float32)
             )
 
-        confidence_scale = _normalize_confidence(confidence)
+        confidence_scale = _normalize_confidence(confidence, backend=selected_backend)
         # Local phase-correlation shifts undershoot subtle subpixel motion unless the
         # amplified field gets a small extra lift before resampling.
         motion_gain = np.float32(magnification * 1.4)
@@ -363,16 +428,21 @@ def amplify_motion_rgb(
                 width=luma.shape[2],
                 source_height=len(layout.row_starts),
                 source_width=len(layout.column_starts),
+                backend=selected_backend,
             ),
             max_displacement_px=max_displacement_px,
             worker_pool=worker_pool,
             worker_count=warp_worker_count,
             progress_callback=progress_callback,
             progress_prefix="warp",
+            backend=selected_backend,
         )
         if progress_callback is not None:
             progress_callback("warp_done")
-        return np.clip(amplified_rgb, 0.0, 1.0).astype(np.float32, copy=False)
+        return selected_backend.xp.clip(amplified_rgb, 0.0, 1.0).astype(
+            selected_backend.xp.float32,
+            copy=False,
+        )
     finally:
         if worker_pool is not None:
             worker_pool.shutdown(wait=True, cancel_futures=True)
@@ -415,15 +485,22 @@ def _estimate_local_phase_shifts(
     worker_pool: Executor | None = None,
     worker_count: int = 1,
     progress_callback: Callable[[str], None] | None,
+    backend: ProcessingBackend | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    selected_backend = _CPU_BACKEND if backend is None else backend
     reference_frame = luma.mean(axis=0, dtype=np.float32).astype(np.float32, copy=False)
-    reference = _build_motion_reference_from_layout(reference_frame, layout=layout)
+    reference = _build_motion_reference_from_layout(
+        reference_frame,
+        layout=layout,
+        backend=selected_backend,
+    )
     return _estimate_local_phase_shifts_against_reference(
         luma,
         reference,
         worker_pool=worker_pool,
         worker_count=worker_count,
         progress_callback=progress_callback,
+        backend=selected_backend,
     )
 
 
@@ -431,21 +508,30 @@ def _build_motion_reference(
     reference_frame: np.ndarray,
     *,
     sigma_scale: float,
+    backend: ProcessingBackend | None = None,
 ) -> _MotionReference:
+    selected_backend = _CPU_BACKEND if backend is None else backend
     layout = _build_motion_grid_layout(
         height=reference_frame.shape[0],
         width=reference_frame.shape[1],
         sigma_scale=sigma_scale,
     )
-    return _build_motion_reference_from_layout(reference_frame, layout=layout)
+    return _build_motion_reference_from_layout(
+        reference_frame,
+        layout=layout,
+        backend=selected_backend,
+    )
 
 
 def _build_motion_reference_from_layout(
     reference_frame: np.ndarray,
     *,
     layout: _MotionGridLayout,
+    backend: ProcessingBackend | None = None,
 ) -> _MotionReference:
-    window = _hann_window(layout.tile_size)
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
+    window = _hann_window(layout.tile_size, backend=selected_backend)
     rows: list[tuple[_MotionReferenceTile, ...]] = []
     for row_start in layout.row_starts:
         row_end = row_start + layout.tile_size
@@ -453,14 +539,16 @@ def _build_motion_reference_from_layout(
         for column_start in layout.column_starts:
             column_end = column_start + layout.tile_size
             reference_tile = reference_frame[row_start:row_end, column_start:column_end]
-            texture_strength = float(reference_tile.std())
+            texture_strength = float(
+                selected_backend.to_host(reference_tile.std(dtype=xp.float32))
+            )
             if texture_strength < 1e-4:
                 tiles.append(
                     _MotionReferenceTile(reference_fft=None, texture_strength=0.0)
                 )
                 continue
-            reference_fft = np.fft.fft2(reference_tile * window).astype(
-                np.complex64,
+            reference_fft = xp.fft.fft2(reference_tile * window).astype(
+                xp.complex64,
                 copy=False,
             )
             tiles.append(
@@ -486,13 +574,19 @@ def _estimate_local_phase_shifts_against_reference(
     worker_pool: Executor | None = None,
     worker_count: int = 1,
     progress_callback: Callable[[str], None] | None,
+    backend: ProcessingBackend | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
     frame_count = luma.shape[0]
     row_count = len(reference.layout.row_starts)
     column_count = len(reference.layout.column_starts)
-    displacement_x = np.zeros((frame_count, row_count, column_count), dtype=np.float32)
-    displacement_y = np.zeros_like(displacement_x)
-    confidence = np.zeros((row_count, column_count), dtype=np.float32)
+    displacement_x = xp.zeros((frame_count, row_count, column_count), dtype=xp.float32)
+    displacement_y = xp.zeros_like(displacement_x)
+    confidence = xp.zeros((row_count, column_count), dtype=xp.float32)
+    if selected_backend.active:
+        worker_pool = None
+        worker_count = 1
     worker_count = max(1, min(int(worker_count), row_count))
     if worker_pool is None or worker_count == 1 or row_count <= 1:
         tile_count = max(1, row_count * column_count)
@@ -506,6 +600,7 @@ def _estimate_local_phase_shifts_against_reference(
                 displacement_x=displacement_x,
                 displacement_y=displacement_y,
                 confidence=confidence,
+                backend=selected_backend,
             )
             if progress_callback is not None:
                 progress_callback(f"motion_grid_tile_{processed_tiles}_of_{tile_count}")
@@ -522,6 +617,7 @@ def _estimate_local_phase_shifts_against_reference(
             displacement_x,
             displacement_y,
             confidence,
+            selected_backend,
         )
         for row_start_index, row_stop_index in row_ranges
     ]
@@ -543,9 +639,12 @@ def _estimate_local_phase_row_band(
     displacement_x: np.ndarray,
     displacement_y: np.ndarray,
     confidence: np.ndarray,
+    backend: ProcessingBackend | None = None,
 ) -> int:
     """Process one deterministic row band of the motion grid so helper threads never compete for the same output slice."""
 
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
     processed_tiles = 0
     for row_index in range(row_start_index, row_stop_index):
         row_start = reference.layout.row_starts[row_index]
@@ -563,17 +662,17 @@ def _estimate_local_phase_row_band(
             tile_stack = (
                 luma[:, row_start:row_end, column_start:column_end]
                 * reference.window[None, :, :]
-            ).astype(np.float32, copy=False)
-            tile_fft = np.fft.fft2(tile_stack, axes=(1, 2)).astype(
-                np.complex64,
+            ).astype(xp.float32, copy=False)
+            tile_fft = xp.fft.fft2(tile_stack, axes=(1, 2)).astype(
+                xp.complex64,
                 copy=False,
             )
-            cross_power = reference_tile.reference_fft[None, :, :] * np.conjugate(
+            cross_power = reference_tile.reference_fft[None, :, :] * xp.conjugate(
                 tile_fft
             )
-            cross_power /= np.maximum(np.abs(cross_power), np.float32(1e-6))
-            correlation = np.abs(np.fft.ifft2(cross_power, axes=(1, 2))).astype(
-                np.float32,
+            cross_power /= xp.maximum(xp.abs(cross_power), xp.float32(1e-6))
+            correlation = xp.abs(xp.fft.ifft2(cross_power, axes=(1, 2))).astype(
+                xp.float32,
                 copy=False,
             )
 
@@ -581,8 +680,9 @@ def _estimate_local_phase_row_band(
                 correlation,
                 displacement_x[:, row_index, column_index],
                 displacement_y[:, row_index, column_index],
+                backend=selected_backend,
             )
-            confidence[row_index, column_index] = np.float32(
+            confidence[row_index, column_index] = xp.float32(
                 reference_tile.texture_strength * peak_quality
             )
             processed_tiles += 1
@@ -606,58 +706,86 @@ def _partition_axis(length: int, partition_count: int) -> list[tuple[int, int]]:
     return ranges
 
 
-def _rgb_to_luma(frames_rgb: np.ndarray) -> np.ndarray:
-    red_weight = np.float32(0.2126)
-    green_weight = np.float32(0.7152)
-    blue_weight = np.float32(0.0722)
+def _rgb_to_luma(
+    frames_rgb: np.ndarray,
+    *,
+    backend: ProcessingBackend | None = None,
+) -> np.ndarray:
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
+    red_weight = xp.float32(0.2126)
+    green_weight = xp.float32(0.7152)
+    blue_weight = xp.float32(0.0722)
     return (
         red_weight * frames_rgb[..., 0]
         + green_weight * frames_rgb[..., 1]
         + blue_weight * frames_rgb[..., 2]
-    ).astype(np.float32, copy=False)
+    ).astype(xp.float32, copy=False)
 
 
 def _extract_tile_motion(
     correlation: np.ndarray,
     displacement_x: np.ndarray,
     displacement_y: np.ndarray,
+    *,
+    backend: ProcessingBackend | None = None,
 ) -> float:
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
     frame_count, height, width = correlation.shape
-    flat_indices = np.argmax(correlation.reshape(frame_count, -1), axis=1)
+    flat_indices = xp.argmax(correlation.reshape(frame_count, -1), axis=1)
     peak_rows = flat_indices // width
     peak_columns = flat_indices % width
-    peak_qualities: list[float] = []
-
-    for frame_index in range(frame_count):
-        peak_row = int(peak_rows[frame_index])
-        peak_column = int(peak_columns[frame_index])
-        surface = correlation[frame_index]
-        displacement_x[frame_index] = _wrap_peak_coordinate(
-            coordinate=float(peak_column)
-            + _subpixel_peak_offset(
-                center=float(surface[peak_row, peak_column]),
-                negative_neighbor=float(surface[peak_row, (peak_column - 1) % width]),
-                positive_neighbor=float(surface[peak_row, (peak_column + 1) % width]),
-            ),
-            length=width,
-        )
-        displacement_y[frame_index] = _wrap_peak_coordinate(
-            coordinate=float(peak_row)
-            + _subpixel_peak_offset(
-                center=float(surface[peak_row, peak_column]),
-                negative_neighbor=float(surface[(peak_row - 1) % height, peak_column]),
-                positive_neighbor=float(surface[(peak_row + 1) % height, peak_column]),
-            ),
-            length=height,
-        )
-        peak_value = float(surface[peak_row, peak_column])
-        peak_qualities.append(peak_value / (float(surface.mean()) + 1e-6))
-
-    return float(np.clip(np.median(peak_qualities) / 4.0, 0.0, 1.0))
+    frame_indices = xp.arange(frame_count, dtype=xp.int32)
+    center = correlation[frame_indices, peak_rows, peak_columns]
+    displacement_x[...] = _wrap_peak_coordinate_array(
+        coordinate=peak_columns.astype(xp.float32)
+        + _subpixel_peak_offset_array(
+            center=center,
+            negative_neighbor=correlation[
+                frame_indices,
+                peak_rows,
+                (peak_columns - 1) % width,
+            ],
+            positive_neighbor=correlation[
+                frame_indices,
+                peak_rows,
+                (peak_columns + 1) % width,
+            ],
+            xp=xp,
+        ),
+        length=width,
+        xp=xp,
+    )
+    displacement_y[...] = _wrap_peak_coordinate_array(
+        coordinate=peak_rows.astype(xp.float32)
+        + _subpixel_peak_offset_array(
+            center=center,
+            negative_neighbor=correlation[
+                frame_indices,
+                (peak_rows - 1) % height,
+                peak_columns,
+            ],
+            positive_neighbor=correlation[
+                frame_indices,
+                (peak_rows + 1) % height,
+                peak_columns,
+            ],
+            xp=xp,
+        ),
+        length=height,
+        xp=xp,
+    )
+    peak_qualities = center / (correlation.mean(axis=(1, 2)) + xp.float32(1e-6))
+    clipped = xp.clip(xp.median(peak_qualities) / xp.float32(4.0), 0.0, 1.0)
+    return float(selected_backend.to_host(clipped))
 
 
 def _subpixel_peak_offset(
-    *, center: float, negative_neighbor: float, positive_neighbor: float
+    *,
+    center: float,
+    negative_neighbor: float,
+    positive_neighbor: float,
 ) -> float:
     denominator = negative_neighbor - 2.0 * center + positive_neighbor
     if abs(denominator) < 1e-6:
@@ -666,88 +794,143 @@ def _subpixel_peak_offset(
     return float(np.clip(offset, -1.0, 1.0))
 
 
+def _subpixel_peak_offset_array(*, center, negative_neighbor, positive_neighbor, xp):
+    denominator = negative_neighbor - (xp.float32(2.0) * center) + positive_neighbor
+    safe_denominator = xp.where(
+        xp.abs(denominator) < xp.float32(1e-6),
+        xp.float32(1.0),
+        denominator,
+    )
+    offset = xp.float32(0.5) * (negative_neighbor - positive_neighbor) / safe_denominator
+    return xp.where(
+        xp.abs(denominator) < xp.float32(1e-6),
+        xp.float32(0.0),
+        xp.clip(offset, -1.0, 1.0).astype(xp.float32, copy=False),
+    )
+
+
 def _wrap_peak_coordinate(*, coordinate: float, length: int) -> float:
     if coordinate > length / 2.0:
         return coordinate - float(length)
     return coordinate
 
 
-def _hann_window(size: int) -> np.ndarray:
-    base = np.hanning(size).astype(np.float32)
-    return np.outer(base, base).astype(np.float32, copy=False)
+def _wrap_peak_coordinate_array(*, coordinate, length: int, xp):
+    return xp.where(
+        coordinate > (length / 2.0),
+        coordinate - xp.float32(length),
+        coordinate,
+    ).astype(xp.float32, copy=False)
+
+
+def _hann_window(size: int, *, backend: ProcessingBackend | None = None) -> np.ndarray:
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
+    base = xp.hanning(size).astype(xp.float32)
+    return xp.outer(base, base).astype(xp.float32, copy=False)
 
 
 def _scale_confidence_against_percentile(
     confidence: np.ndarray,
     *,
     reference_percentile: float,
+    backend: ProcessingBackend | None = None,
 ) -> np.ndarray:
     """Scale one confidence grid against a robust percentile so outliers do not define the whole transfer curve."""
 
-    positive_confidence = confidence[confidence > np.float32(0.0)]
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
+    positive_confidence = confidence[confidence > xp.float32(0.0)]
     if positive_confidence.size == 0:
-        return np.zeros_like(confidence, dtype=np.float32)
-    reference_confidence = float(np.percentile(positive_confidence, reference_percentile))
+        return xp.zeros_like(confidence, dtype=xp.float32)
+    reference_confidence = float(
+        selected_backend.to_host(xp.percentile(positive_confidence, reference_percentile))
+    )
     if reference_confidence <= 1e-6:
-        reference_confidence = float(positive_confidence.max())
+        reference_confidence = float(selected_backend.to_host(positive_confidence.max()))
     if reference_confidence <= 1e-6:
-        return np.zeros_like(confidence, dtype=np.float32)
-    return np.clip(
-        confidence / np.float32(reference_confidence),
+        return xp.zeros_like(confidence, dtype=xp.float32)
+    return xp.clip(
+        confidence / xp.float32(reference_confidence),
         0.0,
         1.0,
-    ).astype(np.float32, copy=False)
+    ).astype(xp.float32, copy=False)
 
 
 def _apply_confidence_floor(
     normalized_confidence: np.ndarray,
     *,
     confidence_floor: float,
+    backend: ProcessingBackend | None = None,
 ) -> np.ndarray:
     """Apply one soft floor so tiny-confidence cells do not survive just because the grid was globally weak."""
 
-    return np.clip(
-        (normalized_confidence - np.float32(confidence_floor))
-        / np.float32(1.0 - confidence_floor),
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
+    return xp.clip(
+        (normalized_confidence - xp.float32(confidence_floor))
+        / xp.float32(1.0 - confidence_floor),
         0.0,
         1.0,
     )
 
 
-def _normalize_confidence(confidence: np.ndarray) -> np.ndarray:
+def _normalize_confidence(
+    confidence: np.ndarray,
+    *,
+    backend: ProcessingBackend | None = None,
+) -> np.ndarray:
     """Return the render-time confidence weight so weak cells are damped without flattening the whole motion field."""
 
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
     # The render path needs to suppress unstable tiles more strongly than the
     # analysis path, but the previous all-smoothstep gate crushed too many
     # medium-confidence cells and visibly thinned the amplified motion field.
     normalized = _scale_confidence_against_percentile(
         confidence,
         reference_percentile=97.0,
+        backend=selected_backend,
     )
-    gated = _apply_confidence_floor(normalized, confidence_floor=0.03)
-    smooth = gated * gated * (np.float32(3.0) - np.float32(2.0) * gated)
-    softened = np.sqrt(gated).astype(np.float32, copy=False)
+    gated = _apply_confidence_floor(
+        normalized,
+        confidence_floor=0.03,
+        backend=selected_backend,
+    )
+    smooth = gated * gated * (xp.float32(3.0) - xp.float32(2.0) * gated)
+    softened = xp.sqrt(gated).astype(xp.float32, copy=False)
     return (
-        np.float32(0.5) * softened + np.float32(0.5) * smooth
+        xp.float32(0.5) * softened + xp.float32(0.5) * smooth
     ).astype(
-        np.float32,
+        xp.float32,
         copy=False,
     )
 
 
-def _normalize_analysis_confidence(confidence: np.ndarray) -> np.ndarray:
+def _normalize_analysis_confidence(
+    confidence: np.ndarray,
+    *,
+    backend: ProcessingBackend | None = None,
+) -> np.ndarray:
     """Return the analysis confidence weight so real motion stays visible in ROI scoring and heatmaps."""
 
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
     # Analysis quality should not collapse just because the render path uses a
     # stricter anti-shimmer gate. Keep a light floor and a square-root lift so
     # mid-confidence cells still contribute coherent heatmap structure.
     normalized = _scale_confidence_against_percentile(
         confidence,
         reference_percentile=98.0,
+        backend=selected_backend,
     )
-    gated = _apply_confidence_floor(normalized, confidence_floor=0.01)
-    return np.sqrt(gated).astype(
-        np.float32,
+    gated = _apply_confidence_floor(
+        normalized,
+        confidence_floor=0.01,
+        backend=selected_backend,
+    )
+    return xp.sqrt(gated).astype(
+        xp.float32,
         copy=False,
     )
 
@@ -760,10 +943,13 @@ def _temporal_bandpass(
     high_hz: float,
     progress_callback: Callable[[str], None] | None = None,
     progress_prefix: str = "temporal",
+    backend: ProcessingBackend | None = None,
 ) -> np.ndarray:
-    frequencies = np.fft.rfftfreq(signal.shape[0], d=1.0 / fps)
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
+    frequencies = xp.fft.rfftfreq(signal.shape[0], d=1.0 / fps)
     passband = (frequencies >= low_hz) & (frequencies <= high_hz)
-    filtered = np.empty_like(signal, dtype=np.float32)
+    filtered = xp.empty_like(signal, dtype=xp.float32)
     row_band_height = _choose_row_band_height(
         signal.shape[0],
         signal.shape[1],
@@ -773,13 +959,13 @@ def _temporal_bandpass(
     passband_shape = (passband.shape[0], 1, 1)
     for band_index, row_start in enumerate(range(0, signal.shape[1], row_band_height), start=1):
         row_end = min(row_start + row_band_height, signal.shape[1])
-        spectrum = np.fft.rfft(signal[:, row_start:row_end, :], axis=0)
+        spectrum = xp.fft.rfft(signal[:, row_start:row_end, :], axis=0)
         filtered_spectrum = spectrum * passband.reshape(passband_shape)
-        filtered[:, row_start:row_end, :] = np.fft.irfft(
+        filtered[:, row_start:row_end, :] = xp.fft.irfft(
             filtered_spectrum,
             n=signal.shape[0],
             axis=0,
-        ).real.astype(np.float32, copy=False)
+        ).real.astype(xp.float32, copy=False)
         if progress_callback is not None:
             progress_callback(f"{progress_prefix}_band_{band_index}_of_{band_count}")
     return filtered
@@ -805,16 +991,25 @@ def _warp_rgb_frames(
     worker_count: int = 1,
     progress_callback: Callable[[str], None] | None,
     progress_prefix: str,
+    backend: ProcessingBackend | None = None,
 ) -> np.ndarray:
+    selected_backend = _CPU_BACKEND if backend is None else backend
     frame_count, height, width, _ = frames_rgb.shape
-    output = np.empty_like(frames_rgb, dtype=np.float32)
+    output = selected_backend.xp.empty_like(
+        frames_rgb,
+        dtype=selected_backend.xp.float32,
+    )
     if geometry is None:
         geometry = _build_warp_geometry(
             height=height,
             width=width,
             source_height=len(layout.row_starts),
             source_width=len(layout.column_starts),
+            backend=selected_backend,
         )
+    if selected_backend.active:
+        worker_pool = None
+        worker_count = 1
     worker_count = max(1, min(int(worker_count), frame_count))
     if worker_pool is None or worker_count == 1 or frame_count <= 1:
         _warp_rgb_frame_slice(
@@ -826,6 +1021,7 @@ def _warp_rgb_frames(
             output=output,
             frame_start=0,
             frame_stop=frame_count,
+            backend=selected_backend,
         )
         if progress_callback is not None:
             progress_step = max(1, frame_count // 24)
@@ -848,6 +1044,7 @@ def _warp_rgb_frames(
             output,
             frame_start,
             frame_stop,
+            selected_backend,
         )
         for frame_start, frame_stop in frame_ranges
     ]
@@ -867,7 +1064,9 @@ def _resize_scalar_field_bilinear(
     target_height: int,
     target_width: int,
     plan: _ScalarFieldResizePlan | None = None,
+    backend: ProcessingBackend | None = None,
 ) -> np.ndarray:
+    selected_backend = _CPU_BACKEND if backend is None else backend
     resize_plan = plan
     if resize_plan is None:
         resize_plan = _build_scalar_field_resize_plan(
@@ -875,8 +1074,13 @@ def _resize_scalar_field_bilinear(
             source_width=field.shape[1],
             target_height=target_height,
             target_width=target_width,
+            backend=selected_backend,
         )
-    return _resize_scalar_field_with_plan(field, resize_plan)
+    return _resize_scalar_field_with_plan(
+        field,
+        resize_plan,
+        backend=selected_backend,
+    )
 
 
 def _build_warp_geometry(
@@ -885,9 +1089,12 @@ def _build_warp_geometry(
     width: int,
     source_height: int,
     source_width: int,
+    backend: ProcessingBackend | None = None,
 ) -> _WarpGeometry:
     """Build the fixed warp sampling lattice once per geometry so the hot loop only does per-frame math."""
 
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
     return _WarpGeometry(
         height=height,
         width=width,
@@ -896,13 +1103,14 @@ def _build_warp_geometry(
             source_width=source_width,
             target_height=height,
             target_width=width,
+            backend=selected_backend,
         ),
-        base_x=np.broadcast_to(
-            np.arange(width, dtype=np.float32)[None, :],
+        base_x=xp.broadcast_to(
+            xp.arange(width, dtype=xp.float32)[None, :],
             (height, width),
         ),
-        base_y=np.broadcast_to(
-            np.arange(height, dtype=np.float32)[:, None],
+        base_y=xp.broadcast_to(
+            xp.arange(height, dtype=xp.float32)[:, None],
             (height, width),
         ),
     )
@@ -914,15 +1122,18 @@ def _build_scalar_field_resize_plan(
     source_width: int,
     target_height: int,
     target_width: int,
+    backend: ProcessingBackend | None = None,
 ) -> _ScalarFieldResizePlan:
     """Precompute bilinear interpolation coordinates once because the motion grid geometry stays fixed for the whole render."""
 
-    x = np.linspace(0.0, source_width - 1, target_width, dtype=np.float32)
-    y = np.linspace(0.0, source_height - 1, target_height, dtype=np.float32)
-    x0 = np.floor(x).astype(np.int32)
-    y0 = np.floor(y).astype(np.int32)
-    x1 = np.clip(x0 + 1, 0, source_width - 1)
-    y1 = np.clip(y0 + 1, 0, source_height - 1)
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
+    x = xp.linspace(0.0, source_width - 1, target_width, dtype=xp.float32)
+    y = xp.linspace(0.0, source_height - 1, target_height, dtype=xp.float32)
+    x0 = xp.floor(x).astype(xp.int32)
+    y0 = xp.floor(y).astype(xp.int32)
+    x1 = xp.clip(x0 + 1, 0, source_width - 1)
+    y1 = xp.clip(y0 + 1, 0, source_height - 1)
     return _ScalarFieldResizePlan(
         source_height=source_height,
         source_width=source_width,
@@ -930,26 +1141,30 @@ def _build_scalar_field_resize_plan(
         target_width=target_width,
         x0=x0,
         x1=x1,
-        wx=(x - x0).astype(np.float32),
+        wx=(x - x0).astype(xp.float32),
         y0=y0,
         y1=y1,
-        wy=(y - y0).astype(np.float32),
+        wy=(y - y0).astype(xp.float32),
     )
 
 
 def _resize_scalar_field_with_plan(
     field: np.ndarray,
     plan: _ScalarFieldResizePlan,
+    *,
+    backend: ProcessingBackend | None = None,
 ) -> np.ndarray:
     """Apply one cached resize plan so each frame only does the interpolation math, not the geometry setup."""
 
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
     if field.shape != (plan.source_height, plan.source_width):
         raise ValueError("field shape does not match the cached resize plan.")
     if (
         plan.source_height == plan.target_height
         and plan.source_width == plan.target_width
     ):
-        return field.astype(np.float32, copy=False)
+        return field.astype(xp.float32, copy=False)
 
     rows0 = field[plan.y0, :]
     rows1 = field[plan.y1, :]
@@ -968,34 +1183,39 @@ def _warp_rgb_frame_slice(
     output: np.ndarray,
     frame_start: int,
     frame_stop: int,
+    backend: ProcessingBackend | None = None,
 ) -> None:
     """Warp one contiguous frame slice so helpers never fight over output ordering or shared write targets."""
 
+    selected_backend = _CPU_BACKEND if backend is None else backend
+    xp = selected_backend.xp
     for frame_index in range(frame_start, frame_stop):
-        full_x = np.clip(
+        full_x = xp.clip(
             _resize_scalar_field_with_plan(
                 displacement_x_grid[frame_index],
                 geometry.resize_plan,
+                backend=selected_backend,
             ),
             -max_displacement_px,
             max_displacement_px,
         )
-        full_y = np.clip(
+        full_y = xp.clip(
             _resize_scalar_field_with_plan(
                 displacement_y_grid[frame_index],
                 geometry.resize_plan,
+                backend=selected_backend,
             ),
             -max_displacement_px,
             max_displacement_px,
         )
-        sample_x = np.clip(geometry.base_x + full_x, 0.0, geometry.width - 1.001)
-        sample_y = np.clip(geometry.base_y + full_y, 0.0, geometry.height - 1.001)
-        x0 = np.floor(sample_x).astype(np.int32)
-        y0 = np.floor(sample_y).astype(np.int32)
-        x1 = np.clip(x0 + 1, 0, geometry.width - 1)
-        y1 = np.clip(y0 + 1, 0, geometry.height - 1)
-        wx = (sample_x - x0).astype(np.float32)
-        wy = (sample_y - y0).astype(np.float32)
+        sample_x = xp.clip(geometry.base_x + full_x, 0.0, geometry.width - 1.001)
+        sample_y = xp.clip(geometry.base_y + full_y, 0.0, geometry.height - 1.001)
+        x0 = xp.floor(sample_x).astype(xp.int32)
+        y0 = xp.floor(sample_y).astype(xp.int32)
+        x1 = xp.clip(x0 + 1, 0, geometry.width - 1)
+        y1 = xp.clip(y0 + 1, 0, geometry.height - 1)
+        wx = (sample_x - x0).astype(xp.float32)
+        wy = (sample_y - y0).astype(xp.float32)
 
         frame = frames_rgb[frame_index]
         top_left = frame[y0, x0]

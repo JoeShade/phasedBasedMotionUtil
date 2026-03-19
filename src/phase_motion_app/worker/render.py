@@ -22,6 +22,7 @@ import psutil
 import numpy as np
 
 from phase_motion_app import __version__
+from phase_motion_app.core.acceleration import build_processing_backend
 from phase_motion_app.core.diagnostics_bundle import (
     DiagnosticsBundleInput,
     write_diagnostics_bundle,
@@ -132,6 +133,7 @@ class _DecodedChunk:
     frame_count: int
     frame_bytes: bytearray
     decode_counter: int
+    buffer_owner: object | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +144,7 @@ class _EncodedChunk:
     frame_count: int
     frame_bytes: bytes
     decode_counter: int
+    buffer_owner: object | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +262,45 @@ def _scheduler_payload_from_inputs(scheduler: SchedulerInputs | None) -> dict[st
     }
 
 
+def _validate_matching_render_resolutions(request: RenderRequest) -> None:
+    """Keep the tied processing/output contract explicit so worker-side bypasses fail before heavy work starts."""
+
+    if request.intent.processing_resolution != request.intent.output_resolution:
+        raise ValueError(
+            "Processing and output resolution must match for the current render pipeline."
+        )
+
+
+def _resolve_processing_backend_for_request(request: RenderRequest):
+    """Resolve one concrete CPU-or-GPU backend for the worker from the stored intent."""
+
+    return build_processing_backend(request.intent.hardware_acceleration_enabled)
+
+
+def _prepare_output_domain_chunks(
+    *,
+    amplified_processing,
+    processing_chunk,
+    request: RenderRequest,
+):
+    """Reuse the processing-domain frames directly because the current render contract no longer allows a second processing-to-output resize."""
+
+    _validate_matching_render_resolutions(request)
+    return amplified_processing, processing_chunk
+
+
+def _validate_encoded_chunk_byte_length(chunk: _EncodedChunk, output_frame_size: int) -> None:
+    """Fail fast if a queued encoded chunk does not contain the exact byte count implied by its frame count."""
+
+    expected_bytes = chunk.frame_count * output_frame_size
+    actual_bytes = len(chunk.frame_bytes)
+    if actual_bytes != expected_bytes:
+        raise ValueError(
+            "Encoded chunk byte length did not match the expected frame count "
+            f"({actual_bytes} bytes for {chunk.frame_count} frames, expected {expected_bytes})."
+        )
+
+
 def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventType) -> None:
     """Run one real render worker attempt using the documented socket protocol and out-of-process media toolchain."""
 
@@ -317,6 +359,8 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
     analysis_collection_warning: str | None = None
     phase_amplifier: StreamingPhaseAmplifier | None = None
     analysis_analyzer: Any | None = None
+    acceleration_decision = None
+    processing_backend = None
 
     def emit(message_type: str, payload: dict | None = None) -> None:
         nonlocal last_emitted_message_type, last_progress_token
@@ -420,6 +464,16 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
         emit("preflight_started", {})
         log("info", "preflight_started", "preflight", "Authoritative worker pre-flight started.")
 
+        try:
+            _validate_matching_render_resolutions(request)
+        except ValueError as exc:
+            emit_failure(
+                "output_resolution_mismatch",
+                "preflight",
+                detail=str(exc),
+            )
+            raise SystemExit(1)
+
         fingerprint = _sha256_file(request.paths.source_path)
         if fingerprint != request.expected_source_fingerprint_sha256:
             emit_failure("stale_source_detected", "preflight")
@@ -465,6 +519,10 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                 "active_scratch_required_bytes": preflight.active_scratch_required_bytes,
                 "ram_required_bytes": preflight.ram_required_bytes,
                 "output_staging_required_bytes": preflight.output_staging_required_bytes,
+                "hardware_acceleration_requested": preflight.hardware_acceleration_requested,
+                "hardware_acceleration_active": preflight.hardware_acceleration_active,
+                "acceleration_backend": preflight.acceleration_backend,
+                "acceleration_status": preflight.acceleration_status,
             },
         )
         log(
@@ -480,6 +538,10 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
         if not preflight.can_render:
             emit_failure(preflight.blockers[0].code, "preflight")
             raise SystemExit(1)
+
+        acceleration_decision, processing_backend = (
+            _resolve_processing_backend_for_request(request)
+        )
 
         source_resolution = normalization_plan.working_resolution
         mask_issues = validate_exclusion_zones(request.intent.exclusion_zones, source_resolution)
@@ -576,19 +638,21 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             normalization_plan=working_plan,
         )
         reference_exit_code: int | None = None
-        reference_luma_sum = np.zeros(
+        if processing_backend is None:
+            raise RuntimeError("Processing backend was not initialized.")
+        reference_luma_sum = processing_backend.xp.zeros(
             (
                 request.intent.processing_resolution.height,
                 request.intent.processing_resolution.width,
             ),
-            dtype=np.float64,
+            dtype=processing_backend.xp.float64,
         )
-        analysis_reference_luma_sum = np.zeros(
+        analysis_reference_luma_sum = processing_backend.xp.zeros(
             (
                 analysis_resolution.height,
                 analysis_resolution.width,
             ),
-            dtype=np.float64,
+            dtype=processing_backend.xp.float64,
         )
         reference_frame_count = 0
         try:
@@ -597,10 +661,12 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                     note_terminal("job_cancelled")
                     emit("job_cancelled", {})
                     raise SystemExit(0)
-                chunk = reference_decoder.read_chunk_bytes(scheduler.chunk_frames)
+                chunk = reference_decoder.read_chunk_bytes(
+                    scheduler.chunk_frames,
+                )
                 if not chunk:
                     break
-                reference_chunk = _bytes_to_float_frames(
+                reference_chunk = processing_backend.bytes_to_float_frames(
                     chunk,
                     width=reference_decode_resolution.width,
                     height=reference_decode_resolution.height,
@@ -611,10 +677,14 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                     processing_chunk = resize_rgb_frames_bilinear(
                         reference_chunk,
                         request.intent.processing_resolution,
+                        backend=processing_backend,
                     )
-                reference_luma_sum += _frames_to_luma(processing_chunk).sum(
+                reference_luma_sum += _frames_to_luma(
+                    processing_chunk,
+                    backend=processing_backend,
+                ).sum(
                     axis=0,
-                    dtype=np.float64,
+                    dtype=processing_backend.xp.float64,
                 )
                 if analysis_resolution == request.intent.processing_resolution:
                     analysis_reference_chunk = processing_chunk
@@ -624,12 +694,14 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                     analysis_reference_chunk = resize_rgb_frames_bilinear(
                         reference_chunk,
                         analysis_resolution,
+                        backend=processing_backend,
                     )
                 analysis_reference_luma_sum += _frames_to_luma(
-                    analysis_reference_chunk
+                    analysis_reference_chunk,
+                    backend=processing_backend,
                 ).sum(
                     axis=0,
-                    dtype=np.float64,
+                    dtype=processing_backend.xp.float64,
                 )
                 reference_frame_count += processing_chunk.shape[0]
                 child_counter = reference_decoder.take_progress_counter() or reference_frame_count
@@ -657,10 +729,14 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
 
         reference_luma = (
             reference_luma_sum / max(reference_frame_count, 1)
-        ).astype(np.float32, copy=False)
+        ).astype(processing_backend.xp.float32, copy=False)
         analysis_reference_luma = (
             analysis_reference_luma_sum / max(reference_frame_count, 1)
-        ).astype(np.float32, copy=False)
+        ).astype(processing_backend.xp.float32, copy=False)
+        del reference_luma_sum
+        del analysis_reference_luma_sum
+        if processing_backend.active:
+            processing_backend.release_unused_memory()
 
         codec_plan = _choose_codec_plan()
         emit("warning", {"messages": list(codec_plan.warnings)})
@@ -673,7 +749,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             output_resolution=request.intent.output_resolution,
             feather_px=request.intent.mask_feather_px,
         )
-        mask_array = np.asarray(mask, dtype=np.float32)
+        mask_array = processing_backend.asarray(mask, dtype=processing_backend.xp.float32)
         phase_amplifier = StreamingPhaseAmplifier(
             reference_luma=reference_luma,
             fps=working_plan.working_fps,
@@ -684,6 +760,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             attenuate_other_frequencies=request.intent.phase.attenuate_other_frequencies,
             warp_worker_count=scheduler.warp_worker_count,
             motion_worker_count=scheduler.motion_worker_count,
+            backend=processing_backend,
         )
         analysis_analyzer = None
         if request.intent.analysis.enabled:
@@ -698,6 +775,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                     exclusion_zones=request.intent.exclusion_zones,
                     drift_assessment=request.drift_assessment,
                     source_resolution=source_resolution,
+                    backend=processing_backend,
                 )
                 if scheduler.analyzer_mode.value == "background_thread":
                     # The helper thread gets a bounded queue so analysis can lag
@@ -764,7 +842,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             * 3
         )
         mask_array_rgb = mask_array[None, :, :, None]
-        inverse_mask_array_rgb = np.float32(1.0) - mask_array_rgb
+        inverse_mask_array_rgb = processing_backend.xp.float32(1.0) - mask_array_rgb
 
         def set_pipeline_failure(
             classification: str,
@@ -820,7 +898,9 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             decoded_frames_completed = 0
             try:
                 while not cancel_event.is_set() and not pipeline_stop.is_set():
-                    chunk = decoder.read_chunk_bytes(scheduler.chunk_frames)
+                    chunk = decoder.read_chunk_bytes(
+                        scheduler.chunk_frames,
+                    )
                     if not chunk:
                         break
                     frame_count = len(chunk) // source_frame_size
@@ -857,6 +937,8 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                 if decode_exit != 0 and not cancel_event.is_set():
                     set_pipeline_failure("decode_failure", "phase_processing")
             except Exception as exc:
+                if processing_backend.active:
+                    processing_backend.release_unused_memory()
                 set_pipeline_failure(
                     _classify_worker_exception(exc),
                     "phase_processing",
@@ -887,7 +969,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                         break
                     chunk = item
                     assert isinstance(chunk, _DecodedChunk)
-                    source_chunk = _bytes_to_float_frames(
+                    source_chunk = processing_backend.bytes_to_float_frames(
                         chunk.frame_bytes,
                         width=source_resolution.width,
                         height=source_resolution.height,
@@ -898,6 +980,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                         else resize_rgb_frames_bilinear(
                             source_chunk,
                             request.intent.processing_resolution,
+                            backend=processing_backend,
                         )
                     )
                     if analysis_analyzer is not None:
@@ -910,6 +993,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                                 analysis_chunk = resize_rgb_frames_bilinear(
                                     source_chunk,
                                     analysis_resolution,
+                                    backend=processing_backend,
                                 )
                             analysis_analyzer.add_chunk(analysis_chunk)
                         except Exception as exc:
@@ -929,43 +1013,40 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                         processing_chunk,
                         progress_callback=report_phase_progress,
                     )
-                    amplified_output = (
-                        amplified_processing
-                        if request.intent.processing_resolution
-                        == request.intent.output_resolution
-                        else resize_rgb_frames_bilinear(
-                            amplified_processing,
-                            request.intent.output_resolution,
-                        )
-                    )
-                    passthrough_output = (
-                        source_chunk
-                        if source_resolution == request.intent.output_resolution
-                        else resize_rgb_frames_bilinear(
-                            source_chunk,
-                            request.intent.output_resolution,
-                        )
+                    amplified_output, passthrough_output = _prepare_output_domain_chunks(
+                        amplified_processing=amplified_processing,
+                        processing_chunk=processing_chunk,
+                        request=request,
                     )
                     # Composite in place so the worker does not keep three full
                     # output-domain copies of the same chunk around at once.
-                    np.multiply(
+                    processing_backend.xp.multiply(
                         amplified_output,
                         inverse_mask_array_rgb,
                         out=amplified_output,
                     )
-                    np.multiply(
+                    processing_backend.xp.multiply(
                         passthrough_output,
                         mask_array_rgb,
                         out=passthrough_output,
                     )
                     amplified_output += passthrough_output
+                    encode_buffer = None
+                    if processing_backend.active:
+                        encode_buffer = processing_backend.allocate_transfer_buffer(
+                            output_frame_size * chunk.frame_count
+                        )
                     if not _queue_put_with_cancel(
                         encoded_queue,
                         _EncodedChunk(
                             chunk_index=chunk.chunk_index,
                             frame_count=chunk.frame_count,
-                            frame_bytes=_float_frames_to_rgb24_bytes(amplified_output),
+                            frame_bytes=processing_backend.float_frames_to_rgb24_bytes(
+                                amplified_output,
+                                transfer_buffer=encode_buffer,
+                            ),
                             decode_counter=chunk.decode_counter,
+                            buffer_owner=encode_buffer,
                         ),
                         cancel_event=cancel_event,
                         stop_event=pipeline_stop,
@@ -1000,6 +1081,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                         break
                     chunk = item
                     assert isinstance(chunk, _EncodedChunk)
+                    _validate_encoded_chunk_byte_length(chunk, output_frame_size)
                     progress_emit_step = max(1, chunk.frame_count // 8)
                     frames_written_for_chunk = 0
                     while frames_written_for_chunk < chunk.frame_count:
@@ -1154,6 +1236,9 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             ),
         )
         if not validation.is_valid:
+            validation_detail = _describe_staged_output_validation_failure(
+                validation.errors
+            )
             log(
                 "error",
                 "staged_output_invalid",
@@ -1161,7 +1246,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
                 "Staged MP4 validation failed.",
                 {"errors": list(validation.errors)},
             )
-            emit_failure("encode_failure", "finalize")
+            emit_failure("encode_failure", "finalize", detail=validation_detail)
             raise SystemExit(1)
 
         record_stage_transition("finalize")
@@ -1221,6 +1306,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             fingerprint=fingerprint,
             preflight=preflight,
             scheduler=scheduler,
+            acceleration_decision=acceleration_decision,
             codec_plan=codec_plan,
             normalization_plan=normalization_plan,
             normalized_source_path=normalized_source_path,
@@ -1361,6 +1447,7 @@ def render_worker_process_main(config: RenderWorkerConfig, cancel_event: EventTy
             failure_stage=failure_stage,
             failure_detail=failure_detail,
             failure_exception_type=failure_exception_type,
+            acceleration_decision=acceleration_decision,
             analysis_artifact_paths=analysis_export.artifact_paths,
         )
         stop_heartbeat.set()
@@ -1403,6 +1490,14 @@ def _describe_encode_stream_failure(
     return detail
 
 
+def _describe_staged_output_validation_failure(errors: tuple[str, ...]) -> str:
+    """Summarize staged-output validation errors so finalize failures stay operator-readable."""
+
+    if not errors:
+        return "Staged MP4 validation failed."
+    return "Staged MP4 validation failed: " + "; ".join(errors)
+
+
 def _write_bundle_if_possible(
     *,
     request: RenderRequest,
@@ -1424,12 +1519,22 @@ def _write_bundle_if_possible(
     failure_stage: str | None,
     failure_detail: str | None,
     failure_exception_type: str | None,
+    acceleration_decision,
     analysis_artifact_paths: dict[str, str],
 ) -> None:
     settings_snapshot = {
         "intent": request.intent.to_dict(),
         "diagnostic_level": request.diagnostic_level.value,
     }
+    if acceleration_decision is not None:
+        settings_snapshot["acceleration"] = {
+            "requested": acceleration_decision.requested,
+            "active": acceleration_decision.active,
+            "backend": acceleration_decision.backend_name,
+            "device_name": acceleration_decision.device_name,
+            "status": acceleration_decision.status,
+            "detail": acceleration_decision.detail,
+        }
     source_payload = {"path": str(request.paths.source_path)}
     if fingerprint is not None:
         source_payload["fingerprint_sha256"] = fingerprint
@@ -1488,6 +1593,10 @@ def _write_bundle_if_possible(
                 "active_scratch_required_bytes": preflight.active_scratch_required_bytes,
                 "ram_required_bytes": preflight.ram_required_bytes,
                 "output_staging_required_bytes": preflight.output_staging_required_bytes,
+                "hardware_acceleration_requested": preflight.hardware_acceleration_requested,
+                "hardware_acceleration_active": preflight.hardware_acceleration_active,
+                "acceleration_backend": preflight.acceleration_backend,
+                "acceleration_status": preflight.acceleration_status,
             }
         )
     scheduler_payload = _scheduler_payload_from_inputs(scheduler)
@@ -1626,15 +1735,16 @@ def _bytes_to_float_frames(
     return float_frames
 
 
-def _frames_to_luma(frames_rgb: np.ndarray) -> np.ndarray:
-    red_weight = np.float32(0.2126)
-    green_weight = np.float32(0.7152)
-    blue_weight = np.float32(0.0722)
+def _frames_to_luma(frames_rgb: np.ndarray, *, backend) -> np.ndarray:
+    xp = backend.xp
+    red_weight = xp.float32(0.2126)
+    green_weight = xp.float32(0.7152)
+    blue_weight = xp.float32(0.0722)
     return (
         red_weight * frames_rgb[..., 0]
         + green_weight * frames_rgb[..., 1]
         + blue_weight * frames_rgb[..., 2]
-    ).astype(np.float32, copy=False)
+    ).astype(xp.float32, copy=False)
 
 
 def _float_frames_to_rgb24_bytes(frames: np.ndarray) -> bytes:
@@ -1710,6 +1820,7 @@ def _build_sidecar_payload(
     fingerprint: str,
     preflight,
     scheduler: SchedulerInputs | None,
+    acceleration_decision,
     codec_plan: CodecPlan,
     normalization_plan: SourceNormalizationPlan | None,
     normalized_source_path: Path | None,
@@ -1729,6 +1840,15 @@ def _build_sidecar_payload(
         ffprobe_version=_query_tool_version(toolchain.ffprobe),
         scheduler_clamp_threads=None if scheduler is None else scheduler.thread_limit,
         effective_thread_limits=_effective_thread_limits_from_scheduler(scheduler),
+        acceleration_backend=(
+            None if acceleration_decision is None else acceleration_decision.backend_name
+        ),
+        acceleration_device_name=(
+            None if acceleration_decision is None else acceleration_decision.device_name
+        ),
+        hardware_acceleration_active=bool(
+            False if acceleration_decision is None else acceleration_decision.active
+        ),
     )
     preflight_summary = PreflightSummary(
         source_fps=probe.avg_fps or probe.fps or 1.0,
@@ -1753,6 +1873,16 @@ def _build_sidecar_payload(
         ),
         warnings=tuple(issue.message for issue in preflight.warnings),
         blockers=tuple(issue.message for issue in preflight.blockers),
+        hardware_acceleration_requested=request.intent.hardware_acceleration_enabled,
+        hardware_acceleration_active=bool(
+            False if acceleration_decision is None else acceleration_decision.active
+        ),
+        acceleration_backend=(
+            None if acceleration_decision is None else acceleration_decision.backend_name
+        ),
+        acceleration_status=(
+            None if acceleration_decision is None else acceleration_decision.detail
+        ),
     )
     source_record = SourceRecord(
         path=str(request.paths.source_path),
@@ -1768,15 +1898,23 @@ def _build_sidecar_payload(
         source_fingerprint_sha256=fingerprint,
         note="Reviewed in the drift-check editor.",
     )
-    warnings = [*codec_plan.warnings, *analysis_export.warnings]
+    acceleration_warnings = []
+    if (
+        acceleration_decision is not None
+        and acceleration_decision.requested
+        and not acceleration_decision.active
+    ):
+        acceleration_warnings.append(acceleration_decision.detail)
+    warnings = [*codec_plan.warnings, *analysis_export.warnings, *acceleration_warnings]
     if analysis_collection_warning is not None and analysis_collection_warning not in warnings:
         warnings.append(analysis_collection_warning)
+    fallbacks = [*codec_plan.warnings, *acceleration_warnings]
     results = {
         "render_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "source": source_record.to_dict(),
         "preflight": preflight_summary.to_dict(),
         "warnings": warnings,
-        "fallbacks": list(codec_plan.warnings),
+        "fallbacks": fallbacks,
         "artifact_paths": {
             "mp4": str(request.paths.final_mp4_path),
             "sidecar": str(request.paths.final_sidecar_path),

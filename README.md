@@ -9,10 +9,14 @@ This repository contains the current Python desktop implementation of the Phase-
 - single-source, single-render desktop workflow
 - fast source probe, canonical source fingerprinting, and first-frame preview
 - drift review plus static source-space mask zones
+- one codec-safe effective render resolution used for both phase processing and final MP4 output
 - optional quantitative-analysis ROI with render-time artifact export
+- Core Settings include an `Enable hardware acceleration` checkbox plus capability status, while the Pre-flight Report carries the final GPU-active or CPU-fallback outcome
 - mandatory shell-side and worker-side pre-flight checks
 - separate render worker with loopback IPC, watchdog supervision, and explicit terminal-state rules
 - bounded worker pipeline with decode, phase processing, optional background analysis handoff, encode, staged validation, and paired MP4/JSON finalization
+- optional CuPy-backed acceleration for dense warp, render-path resize, and FFT-based local motion estimation, with safe CPU fallback when the backend or device is unavailable
+- GPU-backed runs size chunks conservatively against available device memory so the optional accelerated path does not overcommit VRAM
 - diagnostics bundle writing, retained-failure cleanup, and last-used convenience settings
 
 ## Constraints and non-goals
@@ -21,7 +25,7 @@ This repository contains the current Python desktop implementation of the Phase-
 - phase-based amplification only
 - one active render at a time
 - MP4 output only, audio stripped
-- downscale-only output policy
+- no separate output-resolution control beyond the effective processing/render resolution
 - no live mode
 - no full amplified preview mode
 - no batch queue
@@ -50,6 +54,14 @@ python -m pip install -e .[dev]
 
 The project depends on `PyQt6`, `numpy`, `jsonschema`, `psutil`, and `static-ffmpeg`. The worker resolves `ffmpeg` and `ffprobe` through `static-ffmpeg` unless `PHASE_MOTION_FFMPEG` and `PHASE_MOTION_FFPROBE` are both set explicitly.
 
+Optional hardware acceleration uses CuPy but is not required for the default install path. Install a CuPy wheel that matches the local CUDA runtime, for example:
+
+```powershell
+python -m pip install cupy-cuda12x nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12
+```
+
+On Windows, the app will automatically use the packaged NVIDIA runtime and NVRTC paths when those optional wheels are installed. If the optional backend is absent, installed but unusable, or the checkbox is left off, the application reports that CPU execution will be used instead.
+
 ## Tests
 
 Run the full suite:
@@ -74,9 +86,19 @@ When launched from a source checkout, the app uses repo-local `input/`, `output/
 
 Diagnostics are written under the configured diagnostics root, and successful exports are committed only when both the final MP4 and matching JSON sidecar are in place.
 
+## Performance controls
+
+Core Settings include a concise performance block that:
+
+- explains that processing and output resolution are tied to remove the old second resize pass
+- exposes the `Enable hardware acceleration` checkbox
+- reports whether hardware acceleration support is available
+- leaves the final GPU-active or CPU-fallback outcome to the Pre-flight Report
+
+When enabled and available, the accelerated path covers dense RGB warp/remap, render-path resize, FFT-based local motion estimation, and the shared motion-estimation kernels used by quantitative analysis.
+
 ## Supporting docs
 
 - [systemDesign.md](systemDesign.md)
 - [docs/architecture-notes.md](docs/architecture-notes.md)
 - [docs/deviations.md](docs/deviations.md)
-- [PARALLELIZATION_ANALYSIS.md](PARALLELIZATION_ANALYSIS.md)

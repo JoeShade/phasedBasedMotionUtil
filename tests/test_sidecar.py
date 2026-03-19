@@ -30,7 +30,7 @@ def _valid_sidecar() -> dict:
                 "attenuate_other_frequencies": True,
             },
             "processing_resolution": {"width": 1280, "height": 720},
-            "output_resolution": {"width": 640, "height": 360},
+            "output_resolution": {"width": 1280, "height": 720},
             "resource_policy": "balanced",
             "exclusion_zones": [
                 {
@@ -59,6 +59,9 @@ def _valid_sidecar() -> dict:
             "ffprobe_version": "6.1",
             "scheduler_clamp_threads": 7,
             "effective_thread_limits": {"ffmpeg": 4, "opencv": 2},
+            "acceleration_backend": None,
+            "acceleration_device_name": None,
+            "hardware_acceleration_active": False,
         },
         "results": {
             "render_timestamp_utc": "2026-03-16T05:20:00Z",
@@ -74,6 +77,9 @@ def _valid_sidecar() -> dict:
                 "nyquist_limit_hz": 29.97,
                 "warnings": ["High band is close to Nyquist."],
                 "blockers": [],
+                "hardware_acceleration_requested": False,
+                "hardware_acceleration_active": False,
+                "acceleration_status": "Hardware acceleration is disabled. The authoritative CPU path will be used.",
             },
             "warnings": ["Using heuristic SDR acceptance path."],
             "fallbacks": ["Stored output as H.264 High."],
@@ -234,14 +240,25 @@ def test_sidecar_schema_validation_rejects_unknown_intent_fields() -> None:
     assert any("Additional properties" in error for error in validation.errors)
 
 
-def test_sidecar_schema_validation_rejects_upscaled_output_intent() -> None:
+def test_sidecar_schema_validation_rejects_mismatched_output_intent() -> None:
     sidecar = _valid_sidecar()
-    sidecar["intent"]["output_resolution"] = {"width": 1920, "height": 1080}
+    sidecar["intent"]["output_resolution"] = {"width": 640, "height": 360}
 
     validation = validate_sidecar_data(sidecar)
 
     assert validation.status == "invalid"
     assert any("output_resolution" in error for error in validation.errors)
+
+
+def test_sidecar_hardware_acceleration_field_round_trips_through_reusable_intent() -> None:
+    sidecar = _valid_sidecar()
+    sidecar["intent"]["hardware_acceleration_enabled"] = True
+
+    validation = validate_sidecar_data(sidecar)
+    result = load_reusable_intent(sidecar)
+
+    assert validation.status == "valid"
+    assert result.intent.hardware_acceleration_enabled is True
 
 
 def test_sidecar_schema_validation_rejects_mismatched_drift_ack_source() -> None:
@@ -346,7 +363,7 @@ def test_sidecar_schema_validation_accepts_older_version_without_zone_mode() -> 
 
 def test_sidecar_schema_validation_rejects_newer_minor_version() -> None:
     sidecar = _valid_sidecar()
-    sidecar["schema_version"] = "1.4.0"
+    sidecar["schema_version"] = "1.5.0"
 
     validation = validate_sidecar_data(sidecar)
 

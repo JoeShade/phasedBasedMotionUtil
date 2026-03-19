@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from phase_motion_app.core.models import DiagnosticLevel, JobIntent, ResourcePolicy
+from phase_motion_app.core.acceleration import (
+    detect_acceleration_capability,
+    resolve_acceleration_request,
+)
+from phase_motion_app.core.models import DiagnosticLevel, JobIntent, Resolution, ResourcePolicy
+from phase_motion_app.core.quantitative_analysis import (
+    choose_quantitative_analysis_resolution,
+)
 
 
 class PreflightSeverity(str, Enum):
@@ -109,6 +116,10 @@ class PreflightReport:
     active_scratch_required_bytes: int
     ram_required_bytes: int
     output_staging_required_bytes: int
+    hardware_acceleration_requested: bool = False
+    hardware_acceleration_active: bool = False
+    acceleration_backend: str | None = None
+    acceleration_status: str | None = None
 
     @property
     def blockers(self) -> tuple[PreflightIssue, ...]:
@@ -232,6 +243,15 @@ def choose_scheduler_inputs(
         max(source.frame_count, 1),
         chunk_cap_frames,
     )
+    chunk_frames = _cap_chunk_frames_for_available_device_memory(
+        requested=intent.hardware_acceleration_enabled,
+        inputs=probe_inputs,
+        chunk_frames=max(1, int(chunk_frames)),
+    )
+    chunk_frames = _cap_chunk_frames_for_analysis_resolution(
+        inputs=probe_inputs,
+        chunk_frames=max(1, int(chunk_frames)),
+    )
     return SchedulerInputs(
         chunk_frames=max(1, int(chunk_frames)),
         chunk_cap_frames=chunk_cap_frames,
@@ -245,6 +265,92 @@ def choose_scheduler_inputs(
         motion_worker_count=motion_worker_count,
         analyzer_mode=analyzer_mode,
         analysis_queue_depth=analysis_queue_depth,
+    )
+
+
+def _cap_chunk_frames_for_available_device_memory(
+    *,
+    requested: bool,
+    inputs: PreflightInputs,
+    chunk_frames: int,
+) -> int:
+    """Clamp GPU chunk sizing against free device memory so CPU-oriented RAM plans do not overcommit the optional CuPy path."""
+
+    if not requested:
+        return chunk_frames
+    capability = detect_acceleration_capability()
+    acceleration = resolve_acceleration_request(True, capability=capability)
+    if not acceleration.active or capability.device_free_bytes is None:
+        return chunk_frames
+    device_total_bytes = (
+        capability.device_total_bytes
+        if capability.device_total_bytes is not None
+        else capability.device_free_bytes
+    )
+    reserved_device_headroom_bytes = max(
+        512 * 1024 * 1024,
+        int(device_total_bytes * 0.15),
+    )
+    admissible_device_bytes = max(
+        capability.device_free_bytes - reserved_device_headroom_bytes,
+        256 * 1024 * 1024,
+    )
+    conservative_gpu_fraction = min(inputs.scheduler.chunk_target_ram_fraction, 0.40)
+    fixed_overhead_bytes = estimate_streaming_fixed_ram_bytes(inputs)
+    per_frame_bytes = estimate_streaming_per_frame_ram_bytes(inputs)
+    chunk_budget_bytes = max(
+        int(admissible_device_bytes * conservative_gpu_fraction) - fixed_overhead_bytes,
+        per_frame_bytes,
+    )
+    device_chunk_frames = max(1, chunk_budget_bytes // max(per_frame_bytes, 1))
+    return min(
+        chunk_frames,
+        max(1, int(device_chunk_frames)),
+        max(inputs.source.frame_count, 1),
+        inputs.scheduler.chunk_cap_frames,
+    )
+
+
+def _analysis_resolution_for_inputs(inputs: PreflightInputs) -> Resolution:
+    if not inputs.intent.analysis.enabled:
+        return inputs.intent.processing_resolution
+    return choose_quantitative_analysis_resolution(
+        source_resolution=Resolution(
+            width=inputs.source.width,
+            height=inputs.source.height,
+        ),
+        processing_resolution=inputs.intent.processing_resolution,
+    )
+
+
+def _cap_chunk_frames_for_analysis_resolution(
+    *,
+    inputs: PreflightInputs,
+    chunk_frames: int,
+) -> int:
+    """Clamp render chunks when analysis runs at a richer resolution so reference and analysis batches do not grow beyond a safe size."""
+
+    analysis_resolution = _analysis_resolution_for_inputs(inputs)
+    analysis_pixels = analysis_resolution.width * analysis_resolution.height
+    processing_pixels = (
+        inputs.intent.processing_resolution.width
+        * inputs.intent.processing_resolution.height
+    )
+    if analysis_pixels <= processing_pixels:
+        return chunk_frames
+    per_frame_analysis_bytes = (
+        analysis_pixels * 3 * inputs.scheduler.precision_bytes
+    )
+    analysis_chunk_cap_bytes = 192 * 1024 * 1024
+    analysis_chunk_frames = max(
+        1,
+        analysis_chunk_cap_bytes // max(per_frame_analysis_bytes, 1),
+    )
+    return min(
+        chunk_frames,
+        max(1, int(analysis_chunk_frames)),
+        max(inputs.source.frame_count, 1),
+        inputs.scheduler.chunk_cap_frames,
     )
 
 
@@ -372,6 +478,9 @@ def run_preflight(inputs: PreflightInputs) -> PreflightReport:
 
     issues: list[PreflightIssue] = []
     nyquist_limit_hz = inputs.source.fps / 2.0
+    acceleration = resolve_acceleration_request(
+        inputs.intent.hardware_acceleration_enabled
+    )
 
     if inputs.intent.output_container.lower() != "mp4":
         issues.append(
@@ -382,15 +491,12 @@ def run_preflight(inputs: PreflightInputs) -> PreflightReport:
             )
         )
 
-    if (
-        inputs.intent.output_resolution.width > inputs.intent.processing_resolution.width
-        or inputs.intent.output_resolution.height > inputs.intent.processing_resolution.height
-    ):
+    if inputs.intent.output_resolution != inputs.intent.processing_resolution:
         issues.append(
             _issue(
                 PreflightSeverity.BLOCKER,
-                "output_upscale_blocked",
-                "Output resolution must be equal to or smaller than processing resolution.",
+                "output_resolution_mismatch",
+                "Processing and output resolution must match for the current render pipeline.",
             )
         )
 
@@ -546,6 +652,15 @@ def run_preflight(inputs: PreflightInputs) -> PreflightReport:
             )
         )
 
+    if inputs.intent.hardware_acceleration_enabled and not acceleration.active:
+        issues.append(
+            _issue(
+                PreflightSeverity.WARNING,
+                "hardware_acceleration_fallback",
+                acceleration.detail,
+            )
+        )
+
     active_scratch_required = estimate_active_scratch_bytes(inputs)
     output_staging_required = estimate_output_staging_bytes(inputs.intent, inputs.source)
     ram_required = estimate_ram_required_bytes(inputs)
@@ -602,6 +717,10 @@ def run_preflight(inputs: PreflightInputs) -> PreflightReport:
         active_scratch_required_bytes=active_scratch_required,
         ram_required_bytes=ram_required,
         output_staging_required_bytes=output_staging_required,
+        hardware_acceleration_requested=inputs.intent.hardware_acceleration_enabled,
+        hardware_acceleration_active=acceleration.active,
+        acceleration_backend=acceleration.backend_name,
+        acceleration_status=acceleration.detail,
     )
 
 # ######################################################################################################################
