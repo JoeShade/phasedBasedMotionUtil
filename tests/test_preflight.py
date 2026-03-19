@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from phase_motion_app.core.models import JobIntent, PhaseSettings, Resolution, ResourcePolicy
+import phase_motion_app.core.preflight as preflight_module
+
+from phase_motion_app.core.acceleration import AccelerationCapability, AccelerationDecision
+from phase_motion_app.core.models import (
+    AnalysisSettings,
+    JobIntent,
+    PhaseSettings,
+    Resolution,
+    ResourcePolicy,
+)
 from phase_motion_app.core.preflight import (
     AnalyzerExecutionMode,
     DiagnosticLevel,
@@ -209,7 +218,7 @@ def test_preflight_blocks_when_active_scratch_cannot_be_reserved() -> None:
     assert any(issue.code == "active_scratch_reservation_failed" for issue in report.blockers)
 
 
-def test_preflight_blocks_output_upscaling() -> None:
+def test_preflight_blocks_processing_output_resolution_mismatch() -> None:
     intent = JobIntent(
         phase=_intent().phase,
         processing_resolution=Resolution(width=640, height=360),
@@ -219,7 +228,7 @@ def test_preflight_blocks_output_upscaling() -> None:
 
     report = run_preflight(_inputs(intent=intent))
 
-    assert any(issue.code == "output_upscale_blocked" for issue in report.blockers)
+    assert any(issue.code == "output_resolution_mismatch" for issue in report.blockers)
 
 
 def test_preflight_blocks_odd_output_resolution_for_current_encoder_path() -> None:
@@ -234,6 +243,80 @@ def test_preflight_blocks_odd_output_resolution_for_current_encoder_path() -> No
 
     assert any(
         issue.code == "output_resolution_even_required" for issue in report.blockers
+    )
+
+
+def test_preflight_warns_when_hardware_acceleration_is_requested_but_unavailable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        preflight_module,
+        "resolve_acceleration_request",
+        lambda _requested: AccelerationDecision(
+            requested=True,
+            active=False,
+            status="gpu_requested_cpu_fallback",
+            detail=(
+                "Hardware acceleration was requested, but the optional CuPy backend "
+                "is not installed. CPU fallback will be used."
+            ),
+            backend_name="cupy",
+        ),
+    )
+    intent = JobIntent(
+        phase=_intent().phase,
+        processing_resolution=Resolution(width=640, height=360),
+        output_resolution=Resolution(width=640, height=360),
+        resource_policy=ResourcePolicy.BALANCED,
+        hardware_acceleration_enabled=True,
+    )
+
+    report = run_preflight(_inputs(intent=intent))
+
+    assert report.can_render is True
+    assert report.hardware_acceleration_requested is True
+    assert report.hardware_acceleration_active is False
+    assert report.acceleration_backend == "cupy"
+    assert "CPU fallback" in (report.acceleration_status or "")
+    assert any(
+        issue.code == "hardware_acceleration_fallback" for issue in report.warnings
+    )
+
+
+def test_preflight_reports_gpu_status_when_hardware_acceleration_is_available(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        preflight_module,
+        "resolve_acceleration_request",
+        lambda _requested: AccelerationDecision(
+            requested=True,
+            active=True,
+            status="gpu_active",
+            detail="Hardware acceleration is enabled. Using CuPy on Example GPU.",
+            backend_name="cupy",
+            device_name="Example GPU",
+        ),
+    )
+    intent = JobIntent(
+        phase=_intent().phase,
+        processing_resolution=Resolution(width=640, height=360),
+        output_resolution=Resolution(width=640, height=360),
+        resource_policy=ResourcePolicy.BALANCED,
+        hardware_acceleration_enabled=True,
+    )
+
+    report = run_preflight(_inputs(intent=intent))
+
+    assert report.can_render is True
+    assert report.hardware_acceleration_requested is True
+    assert report.hardware_acceleration_active is True
+    assert report.acceleration_backend == "cupy"
+    assert report.acceleration_status == (
+        "Hardware acceleration is enabled. Using CuPy on Example GPU."
+    )
+    assert all(
+        issue.code != "hardware_acceleration_fallback" for issue in report.warnings
     )
 
 
@@ -438,6 +521,89 @@ def test_choose_scheduler_inputs_keeps_motion_estimation_serial_pending_validati
 
     assert conservative.motion_worker_count == 1
     assert aggressive.motion_worker_count == 1
+
+
+def test_choose_scheduler_inputs_caps_gpu_chunk_frames_against_free_device_memory(
+    monkeypatch,
+) -> None:
+    source = _source(frame_count=900, width=1920, height=1080)
+    budgets = _budgets(available_ram_bytes=24 * 1024 * 1024 * 1024)
+    intent = JobIntent(
+        phase=_intent().phase,
+        processing_resolution=Resolution(width=1920, height=1080),
+        output_resolution=Resolution(width=1920, height=1080),
+        resource_policy=ResourcePolicy.AGGRESSIVE,
+        hardware_acceleration_enabled=True,
+    )
+    monkeypatch.setattr(
+        preflight_module,
+        "detect_acceleration_capability",
+        lambda: AccelerationCapability(
+            backend_name="cupy",
+            importable=True,
+            usable=True,
+            status="available",
+            detail="CuPy and a compatible CUDA device are available.",
+            installed_version="13.6.0",
+            device_name="Example GPU",
+            device_total_bytes=8 * 1024 * 1024 * 1024,
+            device_free_bytes=6 * 1024 * 1024 * 1024,
+        ),
+    )
+
+    gpu_scheduler = choose_scheduler_inputs(
+        intent=intent,
+        source=source,
+        budgets=budgets,
+        diagnostic_level=DiagnosticLevel.BASIC,
+    )
+    cpu_scheduler = choose_scheduler_inputs(
+        intent=JobIntent(
+            phase=_intent().phase,
+            processing_resolution=Resolution(width=1920, height=1080),
+            output_resolution=Resolution(width=1920, height=1080),
+            resource_policy=ResourcePolicy.AGGRESSIVE,
+            hardware_acceleration_enabled=False,
+        ),
+        source=source,
+        budgets=budgets,
+        diagnostic_level=DiagnosticLevel.BASIC,
+    )
+
+    assert gpu_scheduler.chunk_frames >= 1
+    assert gpu_scheduler.chunk_frames < cpu_scheduler.chunk_frames
+
+
+def test_choose_scheduler_inputs_caps_chunk_frames_when_analysis_uses_richer_resolution() -> None:
+    source = _source(frame_count=900, width=1280, height=720)
+    budgets = _budgets(available_ram_bytes=16 * 1024 * 1024 * 1024)
+    analysis_enabled = choose_scheduler_inputs(
+        intent=JobIntent(
+            phase=_intent().phase,
+            processing_resolution=Resolution(width=640, height=360),
+            output_resolution=Resolution(width=640, height=360),
+            resource_policy=ResourcePolicy.AGGRESSIVE,
+            analysis=AnalysisSettings(enabled=True),
+        ),
+        source=source,
+        budgets=budgets,
+        diagnostic_level=DiagnosticLevel.TRACE,
+    )
+    analysis_disabled = choose_scheduler_inputs(
+        intent=JobIntent(
+            phase=_intent().phase,
+            processing_resolution=Resolution(width=640, height=360),
+            output_resolution=Resolution(width=640, height=360),
+            resource_policy=ResourcePolicy.AGGRESSIVE,
+            analysis=AnalysisSettings(enabled=False),
+        ),
+        source=source,
+        budgets=budgets,
+        diagnostic_level=DiagnosticLevel.TRACE,
+    )
+
+    assert analysis_enabled.chunk_frames >= 1
+    assert analysis_enabled.chunk_frames < analysis_disabled.chunk_frames
 
 # ######################################################################################################################
 #

@@ -334,6 +334,49 @@ def test_rawvideo_encode_process_accepts_packed_multi_frame_write(tmp_path: Path
     assert info.frame_count == 2
 
 
+def test_rawvideo_encode_process_retries_until_partial_pipe_write_is_complete(
+    monkeypatch,
+) -> None:
+    class _PartialWritePipe(_FakePipe):
+        def __init__(self, events: list[str], name: str) -> None:
+            super().__init__(events, name)
+            self.payload = bytearray()
+
+        def write(self, data: bytes | memoryview) -> int:
+            chunk = bytes(data)
+            self._events.append(f"{self._name}_write:{len(chunk)}")
+            if not chunk:
+                return 0
+            write_size = max(1, len(chunk) // 2)
+            self.payload.extend(chunk[:write_size])
+            return write_size
+
+    events: list[str] = []
+    fake_process = _FakeProcess(events, [0])
+    fake_process.stdin = _PartialWritePipe(events, "stdin")
+    _patch_fake_popen(monkeypatch, fake_process)
+
+    encoder = RawvideoEncodeProcess(
+        staged_output_path="output.mp4",
+        resolution=Resolution(4, 4),
+        fps=2.0,
+        codec="libx264",
+        pixel_format="yuv420p",
+        color_tags={
+            "color_primaries": "bt709",
+            "color_transfer": "bt709",
+            "color_space": "bt709",
+            "color_range": "tv",
+        },
+    )
+    payload = bytes(range(48))
+    encoder.write_frames(payload)
+    encoder.cancel()
+
+    assert bytes(fake_process.stdin.payload) == payload
+    assert len([event for event in events if event.startswith("stdin_write:")]) >= 2
+
+
 def test_rawvideo_decode_process_handles_partial_final_chunk_without_buffer_error(
     tmp_path: Path,
 ) -> None:
@@ -384,6 +427,20 @@ class _FakeLinePipe(_FakePipe):
         return b""
 
 
+class _FakeReadintoPipe(_FakePipe):
+    def __init__(self, events: list[str], name: str, payload: bytes) -> None:
+        super().__init__(events, name)
+        self._payload = bytearray(payload)
+
+    def readinto(self, view) -> int:
+        chunk = self._payload[: len(view)]
+        if not chunk:
+            return 0
+        view[: len(chunk)] = chunk
+        del self._payload[: len(chunk)]
+        return len(chunk)
+
+
 class _FakeProcess:
     def __init__(self, events: list[str], wait_outcomes: list[object]) -> None:
         self.stdin = _FakePipe(events, "stdin")
@@ -416,6 +473,27 @@ def _patch_fake_popen(monkeypatch, fake_process: _FakeProcess) -> None:
         lambda: SimpleNamespace(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe")),
     )
     monkeypatch.setattr(media_tools.subprocess, "Popen", lambda *args, **kwargs: fake_process)
+
+
+def test_rawvideo_decode_process_caps_reads_to_requested_chunk_bytes_with_oversized_buffer(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    fake_process = _FakeProcess(events, [0])
+    payload = bytes(range(24))
+    fake_process.stdout = _FakeReadintoPipe(events, "stdout", payload)
+    _patch_fake_popen(monkeypatch, fake_process)
+
+    decoder = RawvideoDecodeProcess(
+        source_path="source.mp4",
+        output_resolution=Resolution(2, 2),
+    )
+    oversized_buffer = memoryview(bytearray(48))
+    chunk = decoder.read_chunk_bytes(1, into_buffer=oversized_buffer)
+    decoder.close()
+
+    assert len(chunk) == 12
+    assert bytes(chunk) == payload[:12]
 
 
 def test_decode_close_escalates_after_bounded_wait(monkeypatch) -> None:

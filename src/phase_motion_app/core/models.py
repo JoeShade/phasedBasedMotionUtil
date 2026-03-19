@@ -226,6 +226,7 @@ class JobIntent:
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
     output_container: str = "mp4"
     requested_output_codec: str = "prefer_hevc_main10"
+    hardware_acceleration_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -238,6 +239,7 @@ class JobIntent:
             "analysis": self.analysis.to_dict(),
             "output_container": self.output_container,
             "requested_output_codec": self.requested_output_codec,
+            "hardware_acceleration_enabled": self.hardware_acceleration_enabled,
         }
 
     @classmethod
@@ -257,6 +259,9 @@ class JobIntent:
             requested_output_codec=str(
                 data.get("requested_output_codec", "prefer_hevc_main10")
             ),
+            hardware_acceleration_enabled=bool(
+                data.get("hardware_acceleration_enabled", False)
+            ),
         )
 
 
@@ -274,6 +279,9 @@ class ObservedEnvironment:
     ffprobe_version: str | None = None
     scheduler_clamp_threads: int | None = None
     effective_thread_limits: dict[str, int] = field(default_factory=dict)
+    acceleration_backend: str | None = None
+    acceleration_device_name: str | None = None
+    hardware_acceleration_active: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -287,6 +295,9 @@ class ObservedEnvironment:
             "ffprobe_version": self.ffprobe_version,
             "scheduler_clamp_threads": self.scheduler_clamp_threads,
             "effective_thread_limits": self.effective_thread_limits,
+            "acceleration_backend": self.acceleration_backend,
+            "acceleration_device_name": self.acceleration_device_name,
+            "hardware_acceleration_active": self.hardware_acceleration_active,
         }
 
     @classmethod
@@ -309,6 +320,11 @@ class ObservedEnvironment:
                 str(key): int(value)
                 for key, value in data.get("effective_thread_limits", {}).items()
             },
+            acceleration_backend=data.get("acceleration_backend"),
+            acceleration_device_name=data.get("acceleration_device_name"),
+            hardware_acceleration_active=bool(
+                data.get("hardware_acceleration_active", False)
+            ),
         )
 
 
@@ -377,6 +393,10 @@ class PreflightSummary:
     normalization_steps: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
     blockers: tuple[str, ...] = field(default_factory=tuple)
+    hardware_acceleration_requested: bool = False
+    hardware_acceleration_active: bool = False
+    acceleration_backend: str | None = None
+    acceleration_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -385,6 +405,8 @@ class PreflightSummary:
             "nyquist_limit_hz": self.nyquist_limit_hz,
             "warnings": list(self.warnings),
             "blockers": list(self.blockers),
+            "hardware_acceleration_requested": self.hardware_acceleration_requested,
+            "hardware_acceleration_active": self.hardware_acceleration_active,
         }
         if self.working_fps is not None:
             data["working_fps"] = self.working_fps
@@ -392,6 +414,10 @@ class PreflightSummary:
             data["working_source_resolution"] = self.working_source_resolution.to_dict()
         if self.normalization_steps:
             data["normalization_steps"] = list(self.normalization_steps)
+        if self.acceleration_backend is not None:
+            data["acceleration_backend"] = self.acceleration_backend
+        if self.acceleration_status is not None:
+            data["acceleration_status"] = self.acceleration_status
         return data
 
     @classmethod
@@ -413,6 +439,14 @@ class PreflightSummary:
             nyquist_limit_hz=float(data["nyquist_limit_hz"]),
             warnings=tuple(str(item) for item in data.get("warnings", [])),
             blockers=tuple(str(item) for item in data.get("blockers", [])),
+            hardware_acceleration_requested=bool(
+                data.get("hardware_acceleration_requested", False)
+            ),
+            hardware_acceleration_active=bool(
+                data.get("hardware_acceleration_active", False)
+            ),
+            acceleration_backend=data.get("acceleration_backend"),
+            acceleration_status=data.get("acceleration_status"),
         )
 
 

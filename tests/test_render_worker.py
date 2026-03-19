@@ -11,7 +11,11 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
+
 import phase_motion_app.worker.render as render_module
+from phase_motion_app.core.acceleration import AccelerationDecision
 from phase_motion_app.core.ipc import (
     JsonLineConnection,
     SessionConfig,
@@ -83,6 +87,47 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _request(
+    tmp_path: Path,
+    *,
+    hardware_acceleration_enabled: bool = False,
+    processing_resolution: Resolution = Resolution(16, 16),
+    output_resolution: Resolution = Resolution(16, 16),
+) -> RenderRequest:
+    source_path = tmp_path / "request-source.mkv"
+    source_path.write_bytes(b"worker-test-source")
+    return RenderRequest(
+        job_id="job-request",
+        intent=JobIntent(
+            phase=PhaseSettings(
+                magnification=3.0,
+                low_hz=1.0,
+                high_hz=4.0,
+                pyramid_type="complex_steerable",
+                sigma=1.0,
+                attenuate_other_frequencies=True,
+            ),
+            processing_resolution=processing_resolution,
+            output_resolution=output_resolution,
+            resource_policy=ResourcePolicy.CONSERVATIVE,
+            mask_feather_px=4.0,
+            hardware_acceleration_enabled=hardware_acceleration_enabled,
+        ),
+        paths=RenderPaths(
+            source_path=source_path,
+            output_directory=tmp_path / "output",
+            output_stem="result",
+            scratch_directory=tmp_path / "scratch",
+            diagnostics_directory=tmp_path / "diagnostics",
+        ),
+        expected_source_fingerprint_sha256=_sha256(source_path),
+        diagnostic_level=DiagnosticLevel.BASIC,
+        diagnostics_cap_bytes=128 * 1024 * 1024,
+        retention_budget_bytes=1,
+        drift_assessment=DriftAssessment(),
+    )
+
+
 def _drain_messages(
     connection: JsonLineConnection,
     session: SessionConfig,
@@ -95,8 +140,10 @@ def _drain_messages(
     while time.monotonic() < deadline:
         try:
             message = connection.read(timeout_seconds=0.5)
-        except (EOFError, socket.timeout):
+        except EOFError:
             break
+        except socket.timeout:
+            continue
         validate_session_message(message, session, previous_seq)
         previous_seq = message["seq"]
         messages.append(message)
@@ -302,6 +349,19 @@ def test_describe_encode_stream_failure_includes_encoder_stderr() -> None:
     assert "width not divisible by 2" in detail
 
 
+def test_describe_staged_output_validation_failure_joins_errors() -> None:
+    detail = render_module._describe_staged_output_validation_failure(
+        (
+            "Frame count was short.",
+            "Duration was short.",
+        )
+    )
+
+    assert "Staged MP4 validation failed:" in detail
+    assert "Frame count was short." in detail
+    assert "Duration was short." in detail
+
+
 def test_scheduler_payload_reports_real_runtime_plan_fields() -> None:
     payload = render_module._scheduler_payload_from_inputs(
         SchedulerInputs(
@@ -329,6 +389,106 @@ def test_scheduler_payload_reports_real_runtime_plan_fields() -> None:
     assert payload["analyzer_mode"] == "background_thread"
     assert payload["analyzer_queue_depth"] == 2
     assert payload["effective_thread_limits"]["python_warp_worker_threads"] == 6
+
+
+def test_render_worker_reuses_processing_domain_frames_for_output_when_resolutions_match(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    amplified_processing = np.zeros((2, 16, 16, 3), dtype=np.float32)
+    processing_chunk = np.ones((2, 16, 16, 3), dtype=np.float32)
+
+    amplified_output, passthrough_output = render_module._prepare_output_domain_chunks(
+        amplified_processing=amplified_processing,
+        processing_chunk=processing_chunk,
+        request=request,
+    )
+
+    assert amplified_output is amplified_processing
+    assert passthrough_output is processing_chunk
+
+
+def test_validate_encoded_chunk_byte_length_rejects_short_payload() -> None:
+    chunk = render_module._EncodedChunk(
+        chunk_index=1,
+        frame_count=2,
+        frame_bytes=b"\x00" * 5,
+        decode_counter=2,
+    )
+
+    with pytest.raises(ValueError, match="byte length did not match"):
+        render_module._validate_encoded_chunk_byte_length(chunk, 3)
+
+
+def test_render_worker_selects_accelerated_backend_when_requested_and_available(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_backend = SimpleNamespace(name="cupy", active=True)
+    monkeypatch.setattr(
+        render_module,
+        "build_processing_backend",
+        lambda requested: (
+            AccelerationDecision(
+                requested=requested,
+                active=True,
+                status="gpu_active",
+                detail="Hardware acceleration is enabled. Using CuPy on Example GPU.",
+                backend_name="cupy",
+                device_name="Example GPU",
+            ),
+            fake_backend,
+        ),
+    )
+
+    decision, backend = render_module._resolve_processing_backend_for_request(
+        _request(tmp_path, hardware_acceleration_enabled=True)
+    )
+
+    assert decision.active is True
+    assert backend is fake_backend
+
+
+def test_render_worker_uses_cpu_backend_when_acceleration_falls_back(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_backend = SimpleNamespace(name="cpu", active=False)
+    monkeypatch.setattr(
+        render_module,
+        "build_processing_backend",
+        lambda requested: (
+            AccelerationDecision(
+                requested=requested,
+                active=False,
+                status="gpu_requested_cpu_fallback",
+                detail="Hardware acceleration was requested, but CuPy is unavailable. CPU fallback will be used.",
+                backend_name="cupy",
+            ),
+            fake_backend,
+        ),
+    )
+
+    decision, backend = render_module._resolve_processing_backend_for_request(
+        _request(tmp_path, hardware_acceleration_enabled=True)
+    )
+
+    assert decision.active is False
+    assert "CPU fallback" in decision.detail
+    assert backend is fake_backend
+
+
+def test_render_worker_rejects_mismatched_processing_and_output_resolution_request(
+    tmp_path: Path,
+) -> None:
+    request = _request(
+        tmp_path,
+        processing_resolution=Resolution(16, 16),
+        output_resolution=Resolution(12, 12),
+    )
+
+    with pytest.raises(ValueError, match="must match"):
+        render_module._validate_matching_render_resolutions(request)
 
 
 def test_render_worker_reports_incremental_phase_processing_frame_progress(

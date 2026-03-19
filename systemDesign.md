@@ -34,7 +34,8 @@ The current application supports this operator flow:
 - source fingerprinting and stale-source detection
 - drift acknowledgement workflow
 - static include/exclude mask zones with feathering
-- downscale-only output selection
+- one codec-safe effective render resolution used for both phase processing and final encode
+- optional CuPy-backed hardware acceleration for dense warp, render-path resize, and FFT-based local motion estimation with explicit CPU fallback
 - resource-policy-driven scheduler selection
 - mandatory scratch/output/RAM pre-flight admission
 - worker IPC handshake, message validation, and watchdog classification
@@ -53,6 +54,7 @@ The current repository does not implement:
 - arbitrary video editing
 - tracked masks or moving ROIs
 - upscaled output
+- a separate operator-controlled output resize distinct from the processing resolution
 - cloud execution, remote telemetry, or distributed processing
 - analysis-only runs without a render
 
@@ -71,6 +73,7 @@ The `app` package owns PyQt shell behavior:
 - shell-side dry-run pre-flight
 - render launch and supervision
 - display of progress, warnings, terminal outcomes, and cleanup actions
+- the Core Settings hardware-acceleration control plus capability messaging, with final GPU-active or CPU-fallback reporting in the pre-flight report
 - convenience persistence that is explicitly separate from reproducible sidecar intent
 
 The shell must not perform the heavy render pipeline. Long-running render work belongs in the worker.
@@ -84,6 +87,7 @@ The `core` package owns repository-wide rules and models that are testable witho
 - pre-flight logic and scheduler selection
 - masking and drift logic
 - media helper abstractions around `ffmpeg`/`ffprobe`
+- optional acceleration capability detection and CPU/GPU backend selection
 - storage/finalization policy
 - diagnostics and retention policy
 - watchdog and IPC validation
@@ -127,7 +131,7 @@ The shell tracks a cheap snapshot of source path, size, and modification time. I
 
 ### 4.2 Drift and masking
 
-Mask zones and the optional analysis ROI are defined in source-frame coordinates. The same geometry is serialized into sidecars and later scaled into the processing or output domain inside worker/core code.
+Mask zones and the optional analysis ROI are defined in source-frame coordinates. The same geometry is serialized into sidecars and later scaled into the effective render domain inside worker/core code.
 
 The drift editor compares first and last frames. When drift exceeds the warning threshold, render remains blocked until the operator acknowledges the reviewed source state.
 
@@ -141,8 +145,10 @@ Pre-flight is mandatory in two places:
 Current pre-flight gates include:
 
 - output container policy
-- downscale-only output enforcement
+- processing/output resolution equality enforcement
 - even output dimensions for the current encoder path
+- requested hardware-acceleration availability reporting with warning-plus-fallback behavior when CuPy/CUDA cannot be used
+- GPU-aware chunk sizing that clamps the optional accelerated path against currently available device memory before phase processing begins
 - frequency-band sanity versus Nyquist
 - source normalization warnings
 - color/rotation/display-transform blockers
@@ -174,7 +180,7 @@ The current worker pipeline is a bounded two-pass design:
 5. Validate the staged MP4.
 6. Commit the final MP4 and JSON sidecar as a pair.
 
-The pipeline is intentionally deterministic. Helper concurrency is bounded and policy-driven; chunk order remains authoritative.
+The pipeline is intentionally deterministic. One codec-safe effective render resolution is used for both phase processing and the final MP4 output, so the normal render path does not perform a second processing-to-output resize. When the optional CuPy backend is available and the operator enables it, dense warp, render-path resize, and FFT-based local motion estimation run on the GPU while CPU fallback remains authoritative. The scheduler clamps GPU chunk sizing against available device memory, clamps analysis-enabled downscale runs when the richer analysis domain would otherwise make chunks too large, and background quantitative-analysis handoff stores bounded host-side sub-batches so optional analysis does not retain extra device-resident frame batches or require one large host copy.
 
 ### 4.6 Output finalization
 
@@ -224,6 +230,7 @@ Current design rules:
 - one optional ROI is supported
 - whole-frame-minus-mask fallback is supported when no ROI is drawn
 - artifact export is derived from the internal motion-analysis path, not from the encoded MP4
+- when hardware acceleration is active, analysis reuses the same local motion-estimation backend rather than reintroducing a separate CPU-only kernel path
 
 Current exported analysis behavior includes ROI spectra, quality scoring, auto/manual band handling, and heatmap-oriented artifacts driven by the same render-time motion data used for amplification.
 

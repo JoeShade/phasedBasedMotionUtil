@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from phase_motion_app.core.acceleration import AccelerationDecision, CpuProcessingBackend
 from phase_motion_app.core.drift import DriftAssessment
 from phase_motion_app.core.masking import scale_zone_to_domain
 from phase_motion_app.core.models import (
@@ -34,6 +35,15 @@ from phase_motion_app.core.phase_engine import (
     _estimate_local_phase_shifts_against_reference,
     _normalize_analysis_confidence,
     _rgb_to_luma,
+)
+
+_CPU_BACKEND = CpuProcessingBackend(
+    AccelerationDecision(
+        requested=False,
+        active=False,
+        status="cpu_selected",
+        detail="Hardware acceleration is disabled. The authoritative CPU path will be used.",
+    )
 )
 
 
@@ -124,6 +134,7 @@ class _GeneratedBand:
 
 _ANALYSIS_QUEUE_SENTINEL = object()
 _ANALYSIS_INTERNAL_BATCH_FRAMES = 8
+_ANALYSIS_QUEUE_BATCH_FRAMES = 2
 _ANALYSIS_RESOLUTION_MAX_PIXELS = 700_000
 
 
@@ -139,31 +150,49 @@ class _StreamingMotionFieldAnalyzer:
         high_hz: float,
         layout: _MotionGridLayout,
         attenuate_other_frequencies: bool,
+        backend: object | None = None,
     ) -> None:
-        self._reference = _build_motion_reference_from_layout(reference_luma, layout=layout)
+        self._backend = _CPU_BACKEND if backend is None else backend
+        self._reference = _build_motion_reference_from_layout(
+            self._backend.asarray(
+                reference_luma,
+                dtype=self._backend.xp.float32,
+                copy=False,
+            ),
+            layout=layout,
+            backend=self._backend,
+        )
         grid_shape = (len(layout.row_starts), len(layout.column_starts))
         self._x_filter = _StreamingBandpassFilter(
             grid_shape=grid_shape,
             fps=fps,
             low_hz=low_hz,
             high_hz=high_hz,
+            backend=self._backend,
         )
         self._y_filter = _StreamingBandpassFilter(
             grid_shape=grid_shape,
             fps=fps,
             low_hz=low_hz,
             high_hz=high_hz,
+            backend=self._backend,
         )
         self._attenuate_other_frequencies = attenuate_other_frequencies
 
     def analyze_chunk(self, frames_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return band-limited X/Y motion traces plus the chunk confidence map for one bounded frame batch."""
 
-        luma = _rgb_to_luma(frames_rgb.astype(np.float32, copy=False))
+        working = self._backend.asarray(
+            frames_rgb,
+            dtype=self._backend.xp.float32,
+            copy=False,
+        )
+        luma = _rgb_to_luma(working, backend=self._backend)
         displacement_x, displacement_y, confidence = _estimate_local_phase_shifts_against_reference(
             luma,
             self._reference,
             progress_callback=None,
+            backend=self._backend,
         )
         bandpassed_x = self._x_filter.filter_chunk(displacement_x)
         bandpassed_y = self._y_filter.filter_chunk(displacement_y)
@@ -180,7 +209,10 @@ class _StreamingMotionFieldAnalyzer:
         # Quantitative analysis needs a gentler transfer than the render warp so
         # coherent medium-confidence motion still shows up in the exported
         # traces, ROI quality, and heatmaps.
-        confidence_scale = _normalize_analysis_confidence(confidence)
+        confidence_scale = _normalize_analysis_confidence(
+            confidence,
+            backend=self._backend,
+        )
         return (
             phase_motion_x * confidence_scale[None, :, :],
             phase_motion_y * confidence_scale[None, :, :],
@@ -217,19 +249,19 @@ class BackgroundStreamingQuantitativeAnalyzer:
         if frames_rgb.shape[0] == 0:
             return
         self._raise_if_failed()
-        queued_chunk = frames_rgb.astype(np.float32, copy=True)
-        while True:
-            if self._closed.is_set():
-                self._raise_if_failed()
-                raise RuntimeError("Background quantitative analysis is already closed.")
-            if self._cancel_check is not None and self._cancel_check():
-                raise RuntimeError("Background quantitative analysis was cancelled.")
-            try:
-                self._queue.put(queued_chunk, timeout=0.05)
-                return
-            except queue.Full:
-                self._raise_if_failed()
-                continue
+        for queued_chunk in _copy_background_analysis_chunks(frames_rgb):
+            while True:
+                if self._closed.is_set():
+                    self._raise_if_failed()
+                    raise RuntimeError("Background quantitative analysis is already closed.")
+                if self._cancel_check is not None and self._cancel_check():
+                    raise RuntimeError("Background quantitative analysis was cancelled.")
+                try:
+                    self._queue.put(queued_chunk, timeout=0.05)
+                    break
+                except queue.Full:
+                    self._raise_if_failed()
+                    continue
 
     def finalize(self, output_directory: Path) -> QuantitativeAnalysisExport:
         """Drain queued work before exporting so the final artifact set still reflects every accepted chunk in order."""
@@ -283,6 +315,30 @@ class BackgroundStreamingQuantitativeAnalyzer:
         raise RuntimeError("Background quantitative analysis failed.") from failure
 
 
+def _copy_background_analysis_chunks(frames_rgb) -> tuple[np.ndarray, ...]:
+    """Keep bounded background-analysis queue entries on the host in small sub-batches so analysis handoff does not require one large contiguous copy."""
+
+    frame_count = int(frames_rgb.shape[0])
+    if frame_count <= 0:
+        return ()
+    chunk_copies: list[np.ndarray] = []
+    for start in range(0, frame_count, _ANALYSIS_QUEUE_BATCH_FRAMES):
+        stop = min(start + _ANALYSIS_QUEUE_BATCH_FRAMES, frame_count)
+        chunk_copies.append(_copy_background_analysis_chunk(frames_rgb[start:stop]))
+    return tuple(chunk_copies)
+
+
+def _copy_background_analysis_chunk(frames_rgb) -> np.ndarray:
+    """Copy one bounded analysis batch onto the host so the queue never holds device-backed arrays."""
+
+    if isinstance(frames_rgb, np.ndarray):
+        return frames_rgb.astype(np.float32, copy=True)
+    get_method = getattr(frames_rgb, "get", None)
+    if callable(get_method):
+        return np.asarray(get_method(), dtype=np.float32)
+    return np.asarray(frames_rgb, dtype=np.float32)
+
+
 class StreamingQuantitativeAnalyzer:
     """This class accumulates render-time motion traces and exports the full NVH quantitative-analysis artifact set after encode succeeds."""
 
@@ -298,7 +354,9 @@ class StreamingQuantitativeAnalyzer:
         exclusion_zones: tuple[ExclusionZone, ...],
         drift_assessment: DriftAssessment,
         source_resolution: Resolution | None = None,
+        backend: object | None = None,
     ) -> None:
+        self._backend = _CPU_BACKEND if backend is None else backend
         self._settings = settings
         self._processing_resolution = processing_resolution
         self._fps = fps
@@ -338,6 +396,7 @@ class StreamingQuantitativeAnalyzer:
             high_hz=high_hz,
             layout=self._layout,
             attenuate_other_frequencies=True,
+            backend=self._backend,
         )
         self._x_chunks: list[np.ndarray] = []
         self._y_chunks: list[np.ndarray] = []
@@ -346,8 +405,12 @@ class StreamingQuantitativeAnalyzer:
         self._frame_count = 0
         self._representative_still_frame_rgb: np.ndarray | None = None
         self._pending_frames_rgb: np.ndarray | None = None
+        reference_luma_host = self._backend.to_host(reference_luma).astype(
+            np.float32,
+            copy=False,
+        )
         self._fallback_still_frame_rgb = np.repeat(
-            np.clip(reference_luma[:, :, None], 0.0, 1.0),
+            np.clip(reference_luma_host[:, :, None], 0.0, 1.0),
             3,
             axis=2,
         ).astype(np.float32, copy=False)
@@ -358,15 +421,24 @@ class StreamingQuantitativeAnalyzer:
         if frames_rgb.shape[0] == 0:
             return
         if self._representative_still_frame_rgb is None and frames_rgb.shape[0] > 0:
-            self._representative_still_frame_rgb = frames_rgb[0].astype(
+            self._representative_still_frame_rgb = self._backend.to_host(
+                frames_rgb[0]
+            ).astype(
                 np.float32,
                 copy=True,
             )
-        incoming = frames_rgb.astype(np.float32, copy=False)
+        incoming = self._backend.asarray(
+            frames_rgb,
+            dtype=self._backend.xp.float32,
+            copy=False,
+        )
         if self._pending_frames_rgb is not None and self._pending_frames_rgb.shape[0] > 0:
             # Keep one tiny carry-over buffer so analysis uses one fixed internal
             # batch cadence even when the render pipeline changes its chunk size.
-            incoming = np.concatenate((self._pending_frames_rgb, incoming), axis=0)
+            incoming = self._backend.xp.concatenate(
+                (self._pending_frames_rgb, incoming),
+                axis=0,
+            )
             self._pending_frames_rgb = None
 
         processed_frame_count = 0
@@ -379,7 +451,7 @@ class StreamingQuantitativeAnalyzer:
 
         if processed_frame_count < incoming.shape[0]:
             self._pending_frames_rgb = incoming[processed_frame_count:].astype(
-                np.float32,
+                self._backend.xp.float32,
                 copy=True,
             )
 
@@ -533,11 +605,14 @@ class StreamingQuantitativeAnalyzer:
         """Process one fixed internal analysis batch so heatmaps depend on source motion, not render chunk boundaries."""
 
         motion_x, motion_y, confidence = self._motion_analyzer.analyze_chunk(frames_rgb)
-        frame_count = motion_x.shape[0]
-        self._x_chunks.append(motion_x.reshape(frame_count, -1))
-        self._y_chunks.append(motion_y.reshape(frame_count, -1))
+        motion_x_host = self._backend.to_host(motion_x).astype(np.float32, copy=False)
+        motion_y_host = self._backend.to_host(motion_y).astype(np.float32, copy=False)
+        confidence_host = self._backend.to_host(confidence).astype(np.float32, copy=False)
+        frame_count = motion_x_host.shape[0]
+        self._x_chunks.append(motion_x_host.reshape(frame_count, -1))
+        self._y_chunks.append(motion_y_host.reshape(frame_count, -1))
         self._confidence_sum += (
-            confidence.reshape(-1).astype(np.float64, copy=False) * frame_count
+            confidence_host.reshape(-1).astype(np.float64, copy=False) * frame_count
         )
         self._confidence_frame_weight += frame_count
         self._frame_count += frame_count

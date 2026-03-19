@@ -28,8 +28,9 @@ def _intent() -> JobIntent:
             attenuate_other_frequencies=True,
         ),
         processing_resolution=Resolution(1280, 720),
-        output_resolution=Resolution(640, 360),
+        output_resolution=Resolution(1280, 720),
         resource_policy=ResourcePolicy.BALANCED,
+        hardware_acceleration_enabled=True,
     )
 
 
@@ -52,7 +53,8 @@ def test_settings_store_round_trip_preserves_intent_and_global_preferences(
 
     assert loaded is not None
     assert loaded.last_used is not None
-    assert loaded.last_used.intent.output_resolution == Resolution(640, 360)
+    assert loaded.last_used.intent.output_resolution == Resolution(1280, 720)
+    assert loaded.last_used.intent.hardware_acceleration_enabled is True
     assert loaded.last_used.output_stem == "result"
     assert loaded.preferences.retention_budget_gb == 50
 
