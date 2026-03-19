@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.1.0-1f6feb)](./pyproject.toml)
 [![python](https://img.shields.io/badge/python-3.10%2B-3776AB)](./pyproject.toml)
 [![desktop](https://img.shields.io/badge/interface-PyQt6-41CD52)](./README.md)
-[![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./license.md)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 
 `phase-based-motion-utility` is an offline PyQt6 desktop utility for phase-based motion amplification on recorded video. It provides a desktop shell, a testable core domain layer, and a supervised worker process for the render path so operators can review a clip, configure a narrow amplification workflow, and produce an amplified MP4 with matching metadata.
 
@@ -165,4 +165,4 @@ Contributions are welcome when they fit the repository's current scope. Start wi
 
 ## License
 
-This project uses the GNU Affero General Public License v3.0. See [license.md](license.md) for the full license text.
+This project uses the GNU Affero General Public License v3.0. See [LICENSE](LICENSE) for the full license text.
