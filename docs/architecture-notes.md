@@ -27,7 +27,12 @@ If logic can be exercised without Qt and without a child process, it should usua
 
 - mask zones and analysis ROI are stored in source-frame coordinates
 - sidecars reload only reusable `intent`
-- convenience app state is stored separately from reproducible export metadata
+- convenience app state is stored separately from reproducible export metadata and is written through a same-directory temp-file replace
+
+## Toolchain resolution
+
+- `core.toolchain` resolves packaged `ffmpeg` and `ffprobe` by default
+- explicit tool overrides are all-or-nothing; set both `PHASE_MOTION_FFMPEG` and `PHASE_MOTION_FFPROBE` together or leave both unset
 
 ## Diagnostics
 

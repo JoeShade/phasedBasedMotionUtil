@@ -59,6 +59,35 @@ def test_settings_store_round_trip_preserves_intent_and_global_preferences(
     assert loaded.preferences.retention_budget_gb == 50
 
 
+def test_settings_store_save_does_not_leave_temp_file_behind(tmp_path: Path) -> None:
+    state_path = tmp_path / "settings.json"
+    state = PersistedAppState(preferences=default_preferences(tmp_path / "runtime"))
+
+    save_app_state(state_path, state)
+
+    assert state_path.exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_settings_store_save_cleans_temp_file_when_replace_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state_path = tmp_path / "settings.json"
+    state = PersistedAppState(preferences=default_preferences(tmp_path / "runtime"))
+
+    def fake_replace(self: Path, target: Path) -> Path:
+        raise OSError("synthetic replace failure")
+
+    monkeypatch.setattr(Path, "replace", fake_replace)
+
+    with pytest.raises(OSError, match="synthetic replace failure"):
+        save_app_state(state_path, state)
+
+    assert state_path.exists() is False
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_settings_store_missing_file_returns_none(tmp_path: Path) -> None:
     assert load_app_state(tmp_path / "missing.json") is None
 

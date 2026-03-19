@@ -1,39 +1,52 @@
-"""This file resolves packaged ffmpeg and ffprobe paths so probe, extraction, decode, validation, and encode all use an explicit local toolchain."""
+"""This file tests media-toolchain resolution so explicit overrides fail clearly when misconfigured and packaged fallback remains available."""
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
 from pathlib import Path
 
-from static_ffmpeg.run import get_or_fetch_platform_executables_else_raise
+import pytest
+
+import phase_motion_app.core.toolchain as toolchain
 
 
-@dataclass(frozen=True)
-class ToolchainPaths:
-    """This model carries the resolved executable paths so callers do not have to rediscover them repeatedly."""
+def test_resolve_toolchain_prefers_explicit_environment_pair(monkeypatch) -> None:
+    monkeypatch.setenv("PHASE_MOTION_FFMPEG", "~/bin/ffmpeg")
+    monkeypatch.setenv("PHASE_MOTION_FFPROBE", "~/bin/ffprobe")
 
-    ffmpeg: Path
-    ffprobe: Path
+    paths = toolchain.resolve_toolchain()
+
+    assert paths.ffmpeg == Path("~/bin/ffmpeg").expanduser()
+    assert paths.ffprobe == Path("~/bin/ffprobe").expanduser()
 
 
-def resolve_toolchain() -> ToolchainPaths:
-    """Resolve the packaged ffmpeg and ffprobe binaries, allowing explicit environment overrides for later packaging work."""
+def test_resolve_toolchain_rejects_partial_environment_override(monkeypatch) -> None:
+    monkeypatch.setenv("PHASE_MOTION_FFMPEG", "A:/tools/ffmpeg.exe")
+    monkeypatch.delenv("PHASE_MOTION_FFPROBE", raising=False)
+    monkeypatch.setattr(
+        toolchain,
+        "get_or_fetch_platform_executables_else_raise",
+        lambda: (_ for _ in ()).throw(AssertionError("packaged toolchain fallback should not run")),
+    )
 
-    env_ffmpeg = os.environ.get("PHASE_MOTION_FFMPEG")
-    env_ffprobe = os.environ.get("PHASE_MOTION_FFPROBE")
-    if bool(env_ffmpeg) != bool(env_ffprobe):
-        raise ValueError(
-            "PHASE_MOTION_FFMPEG and PHASE_MOTION_FFPROBE must both be set together or both be unset."
-        )
-    if env_ffmpeg and env_ffprobe:
-        return ToolchainPaths(
-            ffmpeg=Path(env_ffmpeg).expanduser(),
-            ffprobe=Path(env_ffprobe).expanduser(),
-        )
+    with pytest.raises(ValueError, match="must both be set together"):
+        toolchain.resolve_toolchain()
 
-    ffmpeg_exe, ffprobe_exe = get_or_fetch_platform_executables_else_raise()
-    return ToolchainPaths(ffmpeg=Path(ffmpeg_exe), ffprobe=Path(ffprobe_exe))
+
+def test_resolve_toolchain_uses_packaged_toolchain_when_overrides_are_absent(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("PHASE_MOTION_FFMPEG", raising=False)
+    monkeypatch.delenv("PHASE_MOTION_FFPROBE", raising=False)
+    monkeypatch.setattr(
+        toolchain,
+        "get_or_fetch_platform_executables_else_raise",
+        lambda: ("A:/packaged/ffmpeg.exe", "A:/packaged/ffprobe.exe"),
+    )
+
+    paths = toolchain.resolve_toolchain()
+
+    assert paths.ffmpeg == Path("A:/packaged/ffmpeg.exe")
+    assert paths.ffprobe == Path("A:/packaged/ffprobe.exe")
 
 # ######################################################################################################################
 #

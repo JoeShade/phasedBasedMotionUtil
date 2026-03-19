@@ -32,7 +32,7 @@ The current application supports this operator flow:
 
 - source probe through `ffprobe`
 - source fingerprinting and stale-source detection
-- drift acknowledgement workflow
+- drift acknowledgement workflow backed by first/last decoded-frame review
 - static include/exclude mask zones with feathering
 - one codec-safe effective render resolution used for both phase processing and final encode
 - optional CuPy-backed hardware acceleration for dense warp, render-path resize, and FFT-based local motion estimation with explicit CPU fallback
@@ -125,7 +125,7 @@ When a source is chosen, the shell starts three lightweight background tasks:
 
 - fast `ffprobe` metadata collection
 - SHA-256 fingerprinting
-- first/last-frame extraction for drift review
+- first/last-frame extraction for drift review and drift estimation
 
 The shell tracks a cheap snapshot of source path, size, and modification time. If the selected file changes or disappears, authoritative readiness is cleared and probe/fingerprint/drift review are restarted or invalidated as needed.
 
@@ -208,6 +208,8 @@ Only reusable intent is loaded back into the shell. Observed environment and pri
 
 Separate from sidecars, the shell stores last-used settings and machine-local preferences in `~/.phase_motion_app/settings.json` by default. This state exists for convenience only and is not part of the reproducible export contract.
 
+The settings file is written through a same-directory temporary file and renamed into place so interrupted writes do not leave a truncated convenience-state file behind.
+
 ### 5.3 Runtime paths
 
 When running from a source checkout, the app defaults to repo-local runtime directories:
@@ -218,6 +220,17 @@ When running from a source checkout, the app defaults to repo-local runtime dire
 - `diagnostics/`
 
 Diagnostics are written under the configured diagnostics root. The convenience settings file remains under `~/.phase_motion_app/` unless explicitly overridden.
+
+### 5.4 Media toolchain resolution
+
+The repository resolves `ffmpeg` and `ffprobe` through `static-ffmpeg` by default.
+
+Explicit environment overrides are supported, but only as a pair:
+
+- `PHASE_MOTION_FFMPEG`
+- `PHASE_MOTION_FFPROBE`
+
+If only one override is set, startup should fail clearly rather than silently mixing one override with one packaged binary.
 
 ## 6. Quantitative Analysis
 

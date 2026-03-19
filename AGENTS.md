@@ -50,6 +50,7 @@ This repository is the Phase-based Motion Amplification Desktop Utility: a PyQt6
 - After implementation, verify the touched behavior directly and run the relevant tests.
 - Before finalizing, do a self-review for correctness, architecture fit, documentation drift, and test coverage gaps.
 - Report assumptions, residual risks, and follow-up items explicitly.
+- Keep `pyproject.toml` and `src/phase_motion_app/__init__.py` version values in sync.
 
 ## Repository hygiene
 
@@ -62,4 +63,5 @@ This repository is the Phase-based Motion Amplification Desktop Utility: a PyQt6
 - Applicable maintained source files in this repository include Python modules, Python tests, Python developer scripts, and `run.bat`.
 - Preserve the standard footer block already present at the bottom of those files.
 - New applicable source files should include the same footer block. The canonical content was migrated from the removed `source-code-footer.txt`; copy an existing source file and adapt only the comment syntax if needed.
+- Do not recreate `source-code-footer.txt`; the footer now lives in the maintained source files themselves.
 - Do not apply the footer to assets, binaries, generated files, Markdown docs, lockfiles, or machine-readable files where extra footer text would be invalid or harmful.

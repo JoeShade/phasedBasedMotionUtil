@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -140,10 +141,30 @@ def load_app_state(path: Path) -> PersistedAppState | None:
 
 
 def save_app_state(path: Path, state: PersistedAppState) -> None:
-    """Write convenience shell state atomically enough for a single-user desktop utility."""
+    """Write convenience shell state through a same-directory temp file so interrupted writes do not leave a truncated settings file behind."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+    serialized = json.dumps(state.to_dict(), indent=2)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(serialized)
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
 # ######################################################################################################################
 #

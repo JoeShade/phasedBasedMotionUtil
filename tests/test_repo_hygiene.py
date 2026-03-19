@@ -1,39 +1,47 @@
-"""This file resolves packaged ffmpeg and ffprobe paths so probe, extraction, decode, validation, and encode all use an explicit local toolchain."""
+"""This file tests repository-level hygiene rules so version drift, footer regressions, and removed migration artifacts are caught automatically."""
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
+import re
 from pathlib import Path
 
-from static_ffmpeg.run import get_or_fetch_platform_executables_else_raise
+import phase_motion_app
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FOOTER_SIGNATURES = (
+    "Copyright (c) JoeShade",
+    "Licensed under the GNU Affero General Public License v3.0",
+)
 
 
-@dataclass(frozen=True)
-class ToolchainPaths:
-    """This model carries the resolved executable paths so callers do not have to rediscover them repeatedly."""
+def _applicable_source_files() -> list[Path]:
+    files: list[Path] = []
+    for relative_root in ("src", "tests", "tools"):
+        files.extend(sorted((REPO_ROOT / relative_root).rglob("*.py")))
+    files.append(REPO_ROOT / "run.bat")
+    return files
 
-    ffmpeg: Path
-    ffprobe: Path
+
+def test_package_version_matches_pyproject() -> None:
+    pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_text, re.MULTILINE)
+
+    assert match is not None
+    assert phase_motion_app.__version__ == match.group(1)
 
 
-def resolve_toolchain() -> ToolchainPaths:
-    """Resolve the packaged ffmpeg and ffprobe binaries, allowing explicit environment overrides for later packaging work."""
+def test_applicable_source_files_preserve_standard_footer() -> None:
+    missing_footer = []
+    for path in _applicable_source_files():
+        text = path.read_text(encoding="utf-8")
+        if not all(signature in text for signature in FOOTER_SIGNATURES):
+            missing_footer.append(str(path.relative_to(REPO_ROOT)))
 
-    env_ffmpeg = os.environ.get("PHASE_MOTION_FFMPEG")
-    env_ffprobe = os.environ.get("PHASE_MOTION_FFPROBE")
-    if bool(env_ffmpeg) != bool(env_ffprobe):
-        raise ValueError(
-            "PHASE_MOTION_FFMPEG and PHASE_MOTION_FFPROBE must both be set together or both be unset."
-        )
-    if env_ffmpeg and env_ffprobe:
-        return ToolchainPaths(
-            ffmpeg=Path(env_ffmpeg).expanduser(),
-            ffprobe=Path(env_ffprobe).expanduser(),
-        )
+    assert missing_footer == []
 
-    ffmpeg_exe, ffprobe_exe = get_or_fetch_platform_executables_else_raise()
-    return ToolchainPaths(ffmpeg=Path(ffmpeg_exe), ffprobe=Path(ffprobe_exe))
+
+def test_legacy_footer_source_file_remains_deleted() -> None:
+    assert (REPO_ROOT / "source-code-footer.txt").exists() is False
 
 # ######################################################################################################################
 #

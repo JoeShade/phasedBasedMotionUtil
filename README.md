@@ -1,104 +1,124 @@
 # Phase-based Motion Amplification Desktop Utility
 
-This repository contains the current Python desktop implementation of the Phase-based Motion Amplification Utility. It is a PyQt6 application for offline processing of recorded video with a separate worker process for probe, validation, amplification, quantitative analysis, encoding, diagnostics, and output finalization.
+This repository contains the current Phase-based Motion Amplification desktop application. It is a PyQt6 shell around a testable core domain layer plus a separate spawned worker process for heavy render execution.
 
-`systemDesign.md` is the primary design and architecture source of truth. `docs/architecture-notes.md` adds short implementation notes, and `docs/deviations.md` is reserved for temporary code/design mismatches.
+The supported product shape is intentionally narrow:
+
+- offline processing of recorded video
+- phase-based amplification only
+- one active render at a time
+- MP4 video output with audio stripped
+- static source-space mask zones and one optional quantitative-analysis ROI
+
+`systemDesign.md` is the primary design source of truth. `docs/architecture-notes.md` adds short implementation notes, and `AGENTS.md` is the contributor/agent workflow guide for this repository.
+
+## Implemented workflow
+
+1. Select a recorded video source.
+2. Run shell-side probe, SHA-256 fingerprinting, and first/last-frame extraction.
+3. Review drift, define static mask zones, and optionally define one quantitative-analysis ROI.
+4. Run shell-side dry-run pre-flight.
+5. Launch one spawned worker that reruns authoritative pre-flight and performs the render.
+6. Finalize a paired MP4 plus JSON sidecar and write diagnostics artifacts.
 
 ## Current capabilities
 
-- single-source, single-render desktop workflow
-- fast source probe, canonical source fingerprinting, and first-frame preview
-- drift review plus static source-space mask zones
-- one codec-safe effective render resolution used for both phase processing and final MP4 output
-- optional quantitative-analysis ROI with render-time artifact export
-- Core Settings include an `Enable hardware acceleration` checkbox plus capability status, while the Pre-flight Report carries the final GPU-active or CPU-fallback outcome
-- mandatory shell-side and worker-side pre-flight checks
-- separate render worker with loopback IPC, watchdog supervision, and explicit terminal-state rules
-- bounded worker pipeline with decode, phase processing, optional background analysis handoff, encode, staged validation, and paired MP4/JSON finalization
-- optional CuPy-backed acceleration for dense warp, render-path resize, and FFT-based local motion estimation, with safe CPU fallback when the backend or device is unavailable
-- GPU-backed runs size chunks conservatively against available device memory so the optional accelerated path does not overcommit VRAM
-- diagnostics bundle writing, retained-failure cleanup, and last-used convenience settings
+- shell-side source probing, source fingerprinting, stale-source detection, and first-frame preview
+- drift review using first/last decoded frames
+- static include/exclude mask zones with feathering
+- tied processing/output resolution with one codec-safe effective render size
+- optional quantitative analysis with auto or manual band behavior and render-time artifact export
+- shell-side plus worker-side pre-flight checks
+- loopback IPC, watchdog supervision, and explicit terminal-state classification
+- bounded worker pipeline with normalization, decode, phase processing, optional background analysis handoff, encode, validation, and paired finalization
+- optional CuPy-backed acceleration for dense warp, render-path resize, and FFT-based local motion estimation, with explicit CPU fallback when the backend is unavailable or disabled
+- diagnostics bundle writing, retained-evidence cleanup, and convenience settings persistence
 
-## Constraints and non-goals
+## Non-goals
 
-- offline processing only
-- phase-based amplification only
-- one active render at a time
-- MP4 output only, audio stripped
-- no separate output-resolution control beyond the effective processing/render resolution
-- no live mode
-- no full amplified preview mode
-- no batch queue
-- no analysis-only mode
+- live capture or live preview
+- full amplified preview playback in the shell
+- batch queues or concurrent renders
+- moving masks or tracked ROIs
+- a separate operator-controlled output resize distinct from processing resolution
+- analysis-only runs without a render
 
 ## Install and run
 
-Runtime install:
+Install from a source checkout:
 
 ```powershell
 python -m pip install -e .
+```
+
+Launch the installed entrypoint:
+
+```powershell
 phase-motion-app
 ```
 
-Windows source-checkout launcher:
+Or launch directly from a Windows source checkout:
 
 ```powershell
 .\run.bat
 ```
 
-Developer install:
+Install developer dependencies:
 
 ```powershell
 python -m pip install -e .[dev]
 ```
 
-The project depends on `PyQt6`, `numpy`, `jsonschema`, `psutil`, and `static-ffmpeg`. The worker resolves `ffmpeg` and `ffprobe` through `static-ffmpeg` unless `PHASE_MOTION_FFMPEG` and `PHASE_MOTION_FFPROBE` are both set explicitly.
+The core runtime dependencies are `PyQt6`, `numpy`, `jsonschema`, `psutil`, and `static-ffmpeg`.
 
-Optional hardware acceleration uses CuPy but is not required for the default install path. Install a CuPy wheel that matches the local CUDA runtime, for example:
+The app resolves `ffmpeg` and `ffprobe` through `static-ffmpeg` by default. If you need explicit overrides, set both `PHASE_MOTION_FFMPEG` and `PHASE_MOTION_FFPROBE` together. Partial override configuration is treated as an error.
+
+Optional hardware acceleration uses CuPy and is not required for the default install path. Install a CuPy wheel that matches the local CUDA runtime, for example:
 
 ```powershell
 python -m pip install cupy-cuda12x nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12
 ```
 
-On Windows, the app will automatically use the packaged NVIDIA runtime and NVRTC paths when those optional wheels are installed. If the optional backend is absent, installed but unusable, or the checkbox is left off, the application reports that CPU execution will be used instead.
+On Windows, the app registers the packaged NVIDIA runtime and NVRTC paths before importing CuPy so optional PyPI-installed GPU support can activate without a separately installed CUDA toolkit.
 
 ## Tests
 
-Run the full suite:
+Run targeted tests while iterating:
+
+```powershell
+python -m pytest tests/test_settings_store.py
+```
+
+Run the full suite before finalizing:
 
 ```powershell
 python -m pytest
 ```
 
-During development, run targeted tests for touched modules first and the full suite before finalizing.
-
 ## Repository layout
 
-- `src/phase_motion_app/app`: PyQt shell, dialogs, shell-side validation, worker supervision, and UI state management
-- `src/phase_motion_app/core`: testable domain logic, models, pre-flight, sidecars, masking, diagnostics, storage, watchdog, and media helpers
-- `src/phase_motion_app/worker`: spawned worker bootstrap plus the render worker implementation
-- `tests`: unit and integration-style tests
-- `tools`: developer-only scripts such as the synthetic pipeline perf smoke
+- `src/phase_motion_app/app`: PyQt shell, dialogs, shell-side validation, and worker supervision
+- `src/phase_motion_app/core`: testable domain logic, models, sidecars, diagnostics, media helpers, storage rules, and numeric processing
+- `src/phase_motion_app/worker`: spawned worker bootstrap plus the real render worker
+- `tests`: regression suite covering core logic, Qt shell behavior, supervision, and worker integration
+- `tools`: developer-only scripts such as the synthetic performance smoke
 
-## Runtime paths
+## Runtime data and sample inputs
 
-When launched from a source checkout, the app uses repo-local `input/`, `output/`, `temp/`, and `diagnostics/` directories by default so development runs stay self-contained. User-level convenience state still lives under `~/.phase_motion_app/settings.json` unless a test or caller overrides the state path.
+When launched from a source checkout, the app defaults to repo-local runtime directories so development stays self-contained:
 
-Diagnostics are written under the configured diagnostics root, and successful exports are committed only when both the final MP4 and matching JSON sidecar are in place.
+- `input/`
+- `output/`
+- `temp/`
+- `diagnostics/`
 
-## Performance controls
+The tracked `input/` clips are development fixtures for manual checks. `output/`, `temp/`, `diagnostics/`, `scratch/`, and similar runtime artifacts are intentionally ignored or reduced to `.gitkeep` placeholders where appropriate.
 
-Core Settings include a concise performance block that:
-
-- explains that processing and output resolution are tied to remove the old second resize pass
-- exposes the `Enable hardware acceleration` checkbox
-- reports whether hardware acceleration support is available
-- leaves the final GPU-active or CPU-fallback outcome to the Pre-flight Report
-
-When enabled and available, the accelerated path covers dense RGB warp/remap, render-path resize, FFT-based local motion estimation, and the shared motion-estimation kernels used by quantitative analysis.
+Convenience state is stored separately under `~/.phase_motion_app/settings.json` unless a test or caller overrides the state path.
 
 ## Supporting docs
 
 - [systemDesign.md](systemDesign.md)
+- [AGENTS.md](AGENTS.md)
 - [docs/architecture-notes.md](docs/architecture-notes.md)
 - [docs/deviations.md](docs/deviations.md)
