@@ -10,8 +10,6 @@ temp/*
 !temp/.gitkeep
 
 # Repo-local source/output staging
-input/*
-!input/.gitkeep
 output/*
 !output/.gitkeep
 
