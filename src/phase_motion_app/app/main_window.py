@@ -17,8 +17,9 @@ from typing import Any
 
 import psutil
 from PyQt6.QtCore import QThread, QTimer, QUrl, Qt, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QDesktopServices, QImage, QPixmap
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QImage, QPixmap, QShowEvent
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -44,6 +45,11 @@ from PyQt6.QtWidgets import (
 
 from phase_motion_app.app.drift_editor import AnalysisRoiEditorDialog, DriftEditorDialog
 from phase_motion_app.app.terminal_outcome import TerminalOutcomeData, TerminalOutcomeDialog
+from phase_motion_app.app.windows_shell import (
+    apply_windows_window_identity,
+    clear_windows_window_identity,
+    load_shell_icon,
+)
 from phase_motion_app.core.acceleration import (
     detect_acceleration_capability,
     resolve_acceleration_request,
@@ -553,6 +559,12 @@ class MainWindow(QMainWindow):
         state_path: Path | None = None,
     ) -> None:
         super().__init__()
+        if (shell_icon := load_shell_icon()) is not None:
+            app = QApplication.instance()
+            if app is not None:
+                app.setWindowIcon(shell_icon)
+            self.setWindowIcon(shell_icon)
+        self._windows_taskbar_identity_applied = False
         self.setWindowTitle("Phase-based Motion Amplification Utility")
         self._controller = SingleJobController()
         self._render_supervisor_factory = (
@@ -3027,12 +3039,20 @@ class MainWindow(QMainWindow):
         )
         return image.copy()
 
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 - Qt naming convention.
+        if not self._windows_taskbar_identity_applied:
+            self._windows_taskbar_identity_applied = apply_windows_window_identity(self)
+        super().showEvent(event)
+
     def resizeEvent(self, event: object) -> None:  # noqa: N802 - Qt naming convention.
         if self._first_frame_image is not None:
             self._set_first_frame_preview(self._first_frame_image)
         super().resizeEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # pragma: no cover - Qt close path.
+        if self._windows_taskbar_identity_applied:
+            clear_windows_window_identity(self)
+            self._windows_taskbar_identity_applied = False
         self._persist_state()
         for worker in (
             self._baseline_band_worker,

@@ -12,6 +12,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QGroupBox
 
 import phase_motion_app.app.main_window as main_window_module
@@ -504,6 +505,58 @@ def test_main_window_defaults_to_repo_local_input_and_output_roots(tmp_path: Pat
     assert hidden_manual_band_container_visible is False
     assert output_folder.exists()
     assert input_folder.exists()
+
+
+def test_main_window_applies_repo_program_icon(tmp_path: Path) -> None:
+    app = _app()
+    app.setWindowIcon(QIcon())
+    window = MainWindow(state_path=tmp_path / "settings.json")
+
+    try:
+        window_icon = window.windowIcon()
+        app_icon = app.windowIcon()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert window_icon.isNull() is False
+    assert app_icon.isNull() is False
+    assert window_icon.cacheKey() == app_icon.cacheKey()
+
+
+def test_main_window_applies_and_clears_windows_taskbar_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = _app()
+    applied: list[MainWindow] = []
+    cleared: list[MainWindow] = []
+
+    monkeypatch.setattr(
+        main_window_module,
+        "apply_windows_window_identity",
+        lambda window: applied.append(window) or True,
+    )
+    monkeypatch.setattr(
+        main_window_module,
+        "clear_windows_window_identity",
+        lambda window: cleared.append(window) or True,
+    )
+    window = MainWindow(state_path=tmp_path / "settings.json")
+
+    try:
+        window.show()
+        app.processEvents()
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
+        app.quit()
+
+    assert applied == [window]
+    assert cleared == [window]
 
 
 def test_main_window_builds_source_metadata_with_rotation_blockers(tmp_path: Path) -> None:

@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication
 
 from phase_motion_app.app.main_window import MainWindow
+from phase_motion_app.app.windows_shell import (
+    _asset_root,
+    configure_windows_process_identity,
+    load_shell_icon,
+)
 
 
 def _build_stylesheet() -> str:
-    asset_root = Path(__file__).resolve().parents[3] / "assets"
+    asset_root = _asset_root()
     watermark_path = asset_root / "grayWatermark.png"
     chevron_up_path = asset_root / "chevron-up-light.svg"
     chevron_down_path = asset_root / "chevron-down-light.svg"
@@ -192,7 +196,10 @@ def _apply_dark_palette(app: QApplication) -> None:
 
 
 def main() -> int:
+    configure_windows_process_identity()
     app = QApplication(sys.argv)
+    if (shell_icon := load_shell_icon()) is not None:
+        app.setWindowIcon(shell_icon)
     _apply_dark_palette(app)
     window = MainWindow()
     window.resize(860, 760)

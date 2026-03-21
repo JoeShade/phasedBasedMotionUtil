@@ -4,6 +4,18 @@ setlocal
 cd /d "%~dp0"
 set "PYTHONPATH=%CD%\src;%PYTHONPATH%"
 
+where pyw >nul 2>nul
+if not errorlevel 1 (
+    pyw -3 -m phase_motion_app.app.main
+    exit /b %ERRORLEVEL%
+)
+
+where pythonw >nul 2>nul
+if not errorlevel 1 (
+    pythonw -m phase_motion_app.app.main
+    exit /b %ERRORLEVEL%
+)
+
 where py >nul 2>nul
 if not errorlevel 1 (
     py -3 -m phase_motion_app.app.main

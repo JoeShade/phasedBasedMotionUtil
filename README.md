@@ -90,7 +90,8 @@ On Windows, a source checkout also includes a convenience launcher:
 .\run.bat
 ```
 
-`run.bat` is intended for Windows source checkouts and expects either `py` or `python` to be available on `PATH`.
+`run.bat` is intended for Windows source checkouts and prefers `pyw` or `pythonw` when available so the shell starts as a GUI process instead of inheriting console-style Python launcher behavior. It falls back to `py` or `python` if needed.
+When launched from a source checkout, the shell also loads repo-level branding assets such as `assets/programIcon.ico`.
 
 ## Features / Current Capabilities
 

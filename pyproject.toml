@@ -21,7 +21,7 @@ dev = [
     "pytest>=8.3",
 ]
 
-[project.scripts]
+[project.gui-scripts]
 phase-motion-app = "phase_motion_app.app.main:main"
 
 [tool.pytest.ini_options]
